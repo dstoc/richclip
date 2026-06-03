@@ -23,3 +23,9 @@ pub mod store;
 pub use error::{Error, Result};
 pub use model::{Format, Item, ItemWithFormats};
 pub use store::Store;
+
+/// Compute the blake3 hex digest of `bytes`.
+///
+/// Re-exported from [`store::blob_hash`] so downstream crates (e.g.
+/// `richclip-wayland`) can hash bytes without adding a `blake3` dependency.
+pub use store::blob_hash;

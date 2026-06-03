@@ -139,6 +139,24 @@ async fn main() -> anyhow::Result<()> {
                     .map(|f| (f.mime, f.bytes))
                     .collect();
 
+                // Self-capture suppression: if this capture exactly matches the
+                // content we most recently restored, it's our own selection
+                // echoing back through the capture device — drop it instead of
+                // creating a duplicate history entry.
+                let captured_fp: std::collections::HashSet<(String, String)> = formats
+                    .iter()
+                    .map(|(mime, bytes)| (mime.clone(), richclip::blob_hash(bytes)))
+                    .collect();
+                let is_self_restore = state_cap
+                    .suppression
+                    .lock()
+                    .map(|g| g.as_ref() == Some(&captured_fp))
+                    .unwrap_or(false);
+                if is_self_restore {
+                    tracing::debug!("ignoring self-restore echo");
+                    continue;
+                }
+
                 let mut store = state_cap.store.lock().await;
                 match store.add_item(&formats) {
                     Ok(id) => {

@@ -11,6 +11,7 @@
 //! connections are long-lived: events are streamed until the client disconnects
 //! (detected by a write error).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -33,6 +34,20 @@ use richclip::Store;
 pub struct DaemonState {
     pub store: Arc<Mutex<Store>>,
     pub watch_tx: broadcast::Sender<WatchEvent>,
+
+    /// Self-capture suppression marker.
+    ///
+    /// When the daemon performs a `restore`, it records the set of
+    /// `(mime, blob_hash)` pairs for the restored item here.  The capture
+    /// consumer (in `richclipd.rs`) checks each freshly captured item against
+    /// this set: if they match, the captured item is the daemon's own restored
+    /// selection echoing back, and it is silently discarded instead of being
+    /// stored as a new history entry.
+    ///
+    /// `None` means no restore is in flight (or the last captured item didn't
+    /// match).  `Some(set)` holds the fingerprint of the most-recently restored
+    /// item.
+    pub suppression: Arc<std::sync::Mutex<Option<HashSet<(String, String)>>>>,
 }
 
 impl DaemonState {
@@ -41,6 +56,7 @@ impl DaemonState {
         Self {
             store: Arc::new(Mutex::new(store)),
             watch_tx,
+            suppression: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -95,8 +111,8 @@ async fn handle_conn_inner(stream: UnixStream, state: DaemonState) -> anyhow::Re
             let resp = handle_get_item(id, &state).await;
             write_response(&mut write_half, &resp).await?;
         }
-        Request::RestoreItem { .. } => {
-            let resp = Response::err("restore not yet implemented", "not_implemented");
+        Request::RestoreItem { id } => {
+            let resp = handle_restore_item(id, &state).await;
             write_response(&mut write_half, &resp).await?;
         }
         Request::WatchEvents(p) => {
@@ -200,6 +216,65 @@ async fn handle_get_item(id: Uuid, state: &DaemonState) -> Response {
         },
         Err(e) => Response::err(e.to_string(), e.json_code()),
     }
+}
+
+async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
+    // ── 1. Look up the item ───────────────────────────────────────────────────
+    let store = state.store.lock().await;
+    let iwf = match store.get_item(id) {
+        Ok(v) => v,
+        Err(e) => return Response::err(e.to_string(), e.json_code()),
+    };
+
+    // ── 2. Collect advertisable formats (exclude application/x-richclip-*) ────
+    let mut formats: Vec<(String, Vec<u8>)> = Vec::new();
+    for fmt in &iwf.formats {
+        if fmt.mime.starts_with("application/x-richclip-") {
+            continue;
+        }
+        match store.decode(id, &fmt.mime) {
+            Ok(bytes) => formats.push((fmt.mime.clone(), bytes)),
+            Err(e) => {
+                tracing::warn!(
+                    "restore: failed to decode {}/{}: {e}; skipping format",
+                    id,
+                    fmt.mime
+                );
+            }
+        }
+    }
+    drop(store); // release the lock before spawning
+
+    if formats.is_empty() {
+        return Response::err("item has no advertisable formats", "error");
+    }
+
+    // ── 3. Build suppression fingerprint ─────────────────────────────────────
+    // Record the set of (mime, blob_hash) pairs for the formats we are about
+    // to advertise.  The capture consumer checks incoming clipboard captures
+    // against this set and discards exact matches (self-restore echoes).
+    let fingerprint: HashSet<(String, String)> = formats
+        .iter()
+        .map(|(mime, bytes)| (mime.clone(), richclip::blob_hash(bytes)))
+        .collect();
+
+    // Store the fingerprint; replace any previous one.
+    if let Ok(mut guard) = state.suppression.lock() {
+        *guard = Some(fingerprint);
+    }
+
+    // ── 4. Spawn restore thread ───────────────────────────────────────────────
+    // The restore runs in a dedicated thread so it doesn't block the async
+    // runtime.  We return `ok` immediately — the caller can paste straight away.
+    // RUNTIME-UNVERIFIED: run_restore connects to Wayland and blocks until
+    // the source is cancelled (another selection replaces ours).
+    std::thread::spawn(move || {
+        if let Err(e) = crate::restore::run_restore(formats) {
+            tracing::warn!("restore thread exited with error: {e}");
+        }
+    });
+
+    Response::ok(None)
 }
 
 // ---------------------------------------------------------------------------

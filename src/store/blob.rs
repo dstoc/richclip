@@ -12,6 +12,14 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// Public re-export of [`hash_bytes`] for use outside the `store` module.
+///
+/// This exists so `richclip-wayland` (which cannot add `blake3` as a direct
+/// dependency) can compute blob hashes without duplicating the logic.
+pub fn blob_hash(bytes: &[u8]) -> String {
+    hash_bytes(bytes)
+}
+
 /// Derive the filesystem path for a blob given the blob root and hash.
 pub fn blob_path(root: &Path, hash: &str) -> PathBuf {
     // hash is a 64-char hex string; use the first two chars as the bucket dir.

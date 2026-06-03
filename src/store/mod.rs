@@ -8,6 +8,9 @@
 mod blob;
 mod db;
 
+// Re-export so callers can hash bytes without depending on blake3 directly.
+pub use blob::blob_hash;
+
 use crate::error::Result;
 use crate::model::{Format, ItemWithFormats};
 use crate::paths::default_data_dir;

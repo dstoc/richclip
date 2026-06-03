@@ -8,6 +8,7 @@
 pub mod capture;
 pub mod daemon;
 pub mod filter;
+pub mod restore;
 
 pub use filter::CaptureConfig;
 
