@@ -64,8 +64,9 @@ async fn main() -> anyhow::Result<()> {
     // ── 2. Resolve paths ─────────────────────────────────────────────────────
     let db_root = resolve_data_dir()?;
     let socket_path = resolve_socket_path()?;
+    let cache_root = resolve_cache_dir()?;
 
-    info!(?db_root, ?socket_path, "richclipd starting");
+    info!(?db_root, ?socket_path, ?cache_root, "richclipd starting");
 
     // ── 3. Single-instance check ──────────────────────────────────────────────
     if socket_path.exists() {
@@ -95,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 4. Open store ─────────────────────────────────────────────────────────
     let store = Store::open(&db_root).context("failed to open store")?;
-    let state = DaemonState::new(store, WATCH_CHANNEL_CAPACITY);
+    let state = DaemonState::new(store, WATCH_CHANNEL_CAPACITY, cache_root);
 
     // ── 5. Bind Unix socket ───────────────────────────────────────────────────
     // Ensure parent directory exists.
@@ -166,6 +167,16 @@ async fn main() -> anyhow::Result<()> {
                             Ok(iwf) => iwf.item.created_at,
                             Err(_) => time::OffsetDateTime::now_utc(),
                         };
+                        // Best-effort thumbnail generation while holding the
+                        // store lock (avoids a second lock/clone; capture is
+                        // not high-frequency so the brief blocking is fine).
+                        if let Err(e) = richclip::thumbnail::generate_item_thumbnail(
+                            &store,
+                            &state_cap.cache_dir,
+                            id,
+                        ) {
+                            warn!(%id, "thumbnail generation failed: {e}");
+                        }
                         drop(store);
                         let _ = state_cap.watch_tx.send(WatchEvent::ItemAdded {
                             id,
@@ -266,4 +277,11 @@ fn resolve_socket_path() -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(v));
     }
     richclip::paths::default_socket_path().context("failed to determine socket path")
+}
+
+fn resolve_cache_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(v) = std::env::var("RICHCLIP_CACHE_DIR") {
+        return Ok(PathBuf::from(v));
+    }
+    richclip::paths::default_cache_dir().context("failed to determine cache directory")
 }

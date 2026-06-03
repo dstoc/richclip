@@ -1,10 +1,13 @@
 //! Pure thumbnail generation for image clipboard items.
 //!
 //! This module is intentionally free of filesystem and store access so that it
-//! can be unit-tested in isolation.
+//! can be unit-tested in isolation (the pure `make_thumbnail` function).
+//! The `generate_item_thumbnail` store-aware helper lives here too.
 
 use crate::error::{Error, Result};
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Default longest edge (pixels) for generated thumbnails.
 pub const DEFAULT_MAX_EDGE: u32 = 256;
@@ -44,6 +47,60 @@ pub fn make_thumbnail(image_bytes: &[u8], max_edge: u32) -> Result<Vec<u8>> {
 
     Ok(buf.into_inner())
 }
+
+// ---------------------------------------------------------------------------
+// Image MIME priority for picking the best format to thumbnail
+// ---------------------------------------------------------------------------
+
+/// Best image format priority order for thumbnail generation.
+/// Formats tried in order; first one present on the item wins.
+const IMAGE_MIME_PRIORITY: [&str; 4] = ["image/png", "image/webp", "image/jpeg", "image/bmp"];
+
+// ---------------------------------------------------------------------------
+// Store-aware helper
+// ---------------------------------------------------------------------------
+
+/// Pick the best image format for `id`, generate a thumbnail with
+/// [`make_thumbnail`], write it to `paths::thumb_path(cache_dir, id)`, and
+/// return that path.
+///
+/// Returns `Ok(None)` if the item has no image format in
+/// `IMAGE_MIME_PRIORITY`.  Errors from the store or filesystem are returned
+/// as `Err`.  Creates `<cache_dir>/thumbs/` as needed.
+pub fn generate_item_thumbnail(
+    store: &crate::Store,
+    cache_dir: &Path,
+    id: Uuid,
+) -> Result<Option<PathBuf>> {
+    // 1. Fetch the item's formats and pick the best image mime.
+    let formats = store.formats(id)?;
+    let mime = IMAGE_MIME_PRIORITY
+        .iter()
+        .find(|&&m| formats.iter().any(|f| f.mime == m))
+        .copied();
+
+    let mime = match mime {
+        Some(m) => m,
+        None => return Ok(None), // no image format on this item
+    };
+
+    // 2. Decode and thumbnail.
+    let bytes = store.decode(id, mime)?;
+    let png = make_thumbnail(&bytes, DEFAULT_MAX_EDGE)?;
+
+    // 3. Write thumbnail to cache dir.
+    let path = crate::paths::thumb_path(cache_dir, id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &png)?;
+
+    Ok(Some(path))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

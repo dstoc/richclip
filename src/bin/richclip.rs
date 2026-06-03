@@ -26,6 +26,9 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+// Thumbnail generation (store-aware).
+use richclip::thumbnail::generate_item_thumbnail;
+
 // ---------------------------------------------------------------------------
 // CLI structure (clap derive)
 // ---------------------------------------------------------------------------
@@ -61,6 +64,8 @@ enum Command {
     Watch(WatchArgs),
     /// Restore an item as the active clipboard (requires richclipd).
     Restore(RestoreArgs),
+    /// (Re)generate a thumbnail for an item; prints its path or nothing if not an image.
+    Thumbnail(ThumbnailArgs),
 }
 
 // --- add ---
@@ -189,6 +194,14 @@ struct RestoreArgs {
     id: String,
 }
 
+// --- thumbnail ---
+
+#[derive(Args)]
+struct ThumbnailArgs {
+    /// Item ID.
+    id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Output structs (owned, for JSON serialisation)
 // ---------------------------------------------------------------------------
@@ -220,6 +233,7 @@ struct ListItemEntry {
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     label: Option<String>,
+    thumbnail: Option<String>,
     formats: Vec<ListFormatEntry>,
 }
 
@@ -292,6 +306,21 @@ fn open_store(data_dir: &Option<PathBuf>) -> Result<Store, AppError> {
         Store::open(&PathBuf::from(env_dir)).map_err(AppError::from)
     } else {
         Store::open_default().map_err(AppError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache dir helper
+// ---------------------------------------------------------------------------
+
+/// Resolve the thumbnail cache directory.
+///
+/// Resolution order: `RICHCLIP_CACHE_DIR` env var → `richclip::paths::default_cache_dir()`.
+fn cache_dir() -> Result<PathBuf, AppError> {
+    if let Ok(env_dir) = std::env::var("RICHCLIP_CACHE_DIR") {
+        Ok(PathBuf::from(env_dir))
+    } else {
+        richclip::paths::default_cache_dir().map_err(AppError::from)
     }
 }
 
@@ -525,11 +554,23 @@ fn cmd_add(cli_data_dir: &Option<PathBuf>, args: AddArgs) -> Result<(), AppError
     let mut store = open_store(cli_data_dir)?;
     let id = store.add_item(&formats)?;
 
+    // Best-effort thumbnail generation.  Print the id first so output is
+    // correct even on thumbnail failure; then attempt generation and warn on
+    // error (never fail the command).
     if args.json {
         println!("{}", serde_json::to_string(&AddOutput { id }).unwrap());
     } else {
         println!("{id}");
     }
+
+    if let Ok(cd) = cache_dir() {
+        if let Err(e) = generate_item_thumbnail(&store, &cd, id) {
+            eprintln!("warning: thumbnail generation failed: {e}");
+        }
+    } else {
+        eprintln!("warning: could not resolve cache dir; thumbnail skipped");
+    }
+
     Ok(())
 }
 
@@ -539,6 +580,9 @@ fn cmd_list(cli_data_dir: &Option<PathBuf>, args: ListArgs) -> Result<(), AppErr
     let items = store.list_items(args.limit, args.mime.as_deref())?;
 
     if args.json {
+        // Resolve cache dir once; if unavailable, all thumbnails will be None.
+        let cd = cache_dir().ok();
+
         let mut output = Vec::with_capacity(items.len());
         for iwf in &items {
             let label = derive_label(&store, iwf.item.id);
@@ -550,10 +594,20 @@ fn cmd_list(cli_data_dir: &Option<PathBuf>, args: ListArgs) -> Result<(), AppErr
                     size: f.size,
                 })
                 .collect();
+            // Report existing thumbnail file; never generate here.
+            let thumbnail = cd.as_ref().and_then(|c| {
+                let p = richclip::paths::thumb_path(c, iwf.item.id);
+                if p.exists() {
+                    Some(p.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            });
             output.push(ListItemEntry {
                 id: iwf.item.id,
                 created_at: iwf.item.created_at,
                 label,
+                thumbnail,
                 formats,
             });
         }
@@ -722,6 +776,11 @@ fn cmd_delete(cli_data_dir: &Option<PathBuf>, args: DeleteArgs) -> Result<(), Ap
         let resp = ipc_client::send_request(&mut stream, &req)
             .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
         response_to_result(resp)?;
+        // Best-effort thumbnail cleanup (daemon also cleans up, but this covers
+        // the case where the cache dir is local to the CLI process).
+        if let Ok(cd) = cache_dir() {
+            let _ = std::fs::remove_file(richclip::paths::thumb_path(&cd, id));
+        }
         if args.json {
             println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
         }
@@ -730,6 +789,10 @@ fn cmd_delete(cli_data_dir: &Option<PathBuf>, args: DeleteArgs) -> Result<(), Ap
 
     let mut store = open_store(cli_data_dir)?;
     store.delete_item(id)?;
+    // Best-effort thumbnail cleanup.
+    if let Ok(cd) = cache_dir() {
+        let _ = std::fs::remove_file(richclip::paths::thumb_path(&cd, id));
+    }
     if args.json {
         println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
     }
@@ -812,6 +875,17 @@ fn cmd_restore(args: RestoreArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+fn cmd_thumbnail(cli_data_dir: &Option<PathBuf>, args: ThumbnailArgs) -> Result<(), AppError> {
+    let id = parse_uuid(&args.id)?;
+    let store = open_store(cli_data_dir)?;
+    let cd = cache_dir()?;
+    match generate_item_thumbnail(&store, &cd, id)? {
+        Some(path) => println!("{}", path.display()),
+        None => {} // not an image item — print nothing, exit 0
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -829,6 +903,7 @@ fn run() -> Result<(), AppError> {
         Command::Inspect(args) => cmd_inspect(&cli.data_dir, args),
         Command::Watch(args) => cmd_watch(args),
         Command::Restore(args) => cmd_restore(args),
+        Command::Thumbnail(args) => cmd_thumbnail(&cli.data_dir, args),
     }
 }
 

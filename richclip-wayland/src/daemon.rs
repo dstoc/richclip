@@ -12,6 +12,7 @@
 //! (detected by a write error).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -35,6 +36,12 @@ pub struct DaemonState {
     pub store: Arc<Mutex<Store>>,
     pub watch_tx: broadcast::Sender<WatchEvent>,
 
+    /// Directory where per-item thumbnail files are written.
+    ///
+    /// Resolved at startup from `RICHCLIP_CACHE_DIR` or
+    /// `richclip::paths::default_cache_dir()`.
+    pub cache_dir: PathBuf,
+
     /// Self-capture suppression marker.
     ///
     /// When the daemon performs a `restore`, it records the set of
@@ -51,11 +58,12 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub fn new(store: Store, watch_capacity: usize) -> Self {
+    pub fn new(store: Store, watch_capacity: usize, cache_dir: PathBuf) -> Self {
         let (watch_tx, _) = broadcast::channel(watch_capacity);
         Self {
             store: Arc::new(Mutex::new(store)),
             watch_tx,
+            cache_dir,
             suppression: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -190,6 +198,9 @@ async fn handle_delete_item(id: Uuid, state: &DaemonState) -> Response {
         Ok(()) => {
             drop(store);
             let _ = state.watch_tx.send(WatchEvent::ItemDeleted { id });
+            // Best-effort thumbnail cleanup.
+            let thumb = richclip::paths::thumb_path(&state.cache_dir, id);
+            let _ = std::fs::remove_file(&thumb);
             Response::ok(None)
         }
         Err(e) => Response::err(e.to_string(), e.json_code()),
