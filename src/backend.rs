@@ -1,29 +1,43 @@
-//! Phase-2 seam: the [`ClipboardBackend`] trait and minimal placeholder types.
+//! Phase-2 seam: the [`ClipboardBackend`] trait and capture sink types.
 //!
-//! Nothing here is wired up in Phase 1. The trait gives a stable boundary for
-//! the Wayland capture/restore implementation that will land in Phase 2.
+//! [`CaptureSink`] is a callback-based sink that the Wayland capture loop
+//! pushes completed clipboard items into. Keeping tokio out of this root lib
+//! means the core storage crate remains runtime-agnostic.
 
 #![allow(dead_code)]
 
 use crate::model::ItemWithFormats;
 
-/// A sink that receives captured clipboard data from the backend.
+/// One captured MIME representation of a clipboard item.
+pub struct CapturedFormat {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A captured clipboard selection: all accepted formats grouped together.
+pub struct CapturedItem {
+    pub formats: Vec<CapturedFormat>,
+}
+
+/// Sink the capture loop pushes completed items into.
 ///
-/// Phase 2 will fill this out; for now it is a minimal placeholder so the
-/// trait compiles.
+/// The handler runs on the (blocking) Wayland thread, so it must be `Send`.
+/// Construct with [`CaptureSink::new`], then pass to
+/// [`ClipboardBackend::run_capture_loop`].
 pub struct CaptureSink {
-    _private: (),
+    handler: Box<dyn FnMut(CapturedItem) + Send>,
 }
 
 impl CaptureSink {
-    pub fn new() -> Self {
-        CaptureSink { _private: () }
+    /// Create a sink backed by `handler`. The handler is called once per
+    /// completed clipboard selection, on whatever thread the capture loop runs.
+    pub fn new(handler: impl FnMut(CapturedItem) + Send + 'static) -> Self {
+        Self { handler: Box::new(handler) }
     }
-}
 
-impl Default for CaptureSink {
-    fn default() -> Self {
-        Self::new()
+    /// Deliver a captured item to the handler.
+    pub fn push(&mut self, item: CapturedItem) {
+        (self.handler)(item)
     }
 }
 
@@ -39,7 +53,7 @@ pub struct RestorableItem {
 /// Trait that Wayland (or any future) backend implements.
 ///
 /// Both methods are async; the concrete implementation will drive a Wayland
-/// event loop. Phase 2 will provide `WlrDataControlBackend: ClipboardBackend`.
+/// event loop. Phase 2 provides `WlrDataControlBackend: ClipboardBackend`.
 pub trait ClipboardBackend {
     /// Run the capture loop, delivering new items to `sink` as they arrive.
     ///
