@@ -1,0 +1,48 @@
+#!/bin/sh
+# richclip-fuzzel — pick a clipboard history item with fuzzel and restore it.
+#
+# Consumes `richclip list --json`, shows one fuzzel entry per item (with the
+# thumbnail as an icon when present), and restores the chosen item *by index*
+# so the selection is never confused by duplicate or empty labels.
+#
+# Requirements: richclip, richclipd (running, for restore), fuzzel, jq.
+# fuzzel must support `--dmenu --index` (prints the selected entry's 0-based
+# index instead of its text).
+#
+# This script is deliberately NOT part of the richclip binaries: the core stays
+# UI-agnostic. Copy/adapt it for rofi/wofi/tofi by swapping the menu command.
+set -eu
+
+json="$(richclip list --json)" || {
+	echo "richclip-fuzzel: failed to list items (is richclipd running?)" >&2
+	exit 1
+}
+
+[ "$(printf '%s' "$json" | jq 'length')" -gt 0 ] || exit 0   # empty history
+
+# Item ids in list order; the chosen index maps into this list.
+ids="$(printf '%s' "$json" | jq -r '.[].id')"
+
+# Build the menu on a pipe. Each item becomes either a plain text entry or, when
+# a thumbnail exists, "text\0icon\x1f/path" — fuzzel's per-entry icon escape
+# (NUL = \0, 0x1f = \037 in octal).
+idx="$(
+	printf '%s' "$json" \
+		| jq -r '.[] | [ (.label // (.formats | map(.mime) | join(", "))), (.thumbnail // "") ] | @tsv' \
+		| while IFS="$(printf '\t')" read -r text thumb; do
+			if [ -n "$thumb" ]; then
+				printf '%s\0icon\037%s\n' "$text" "$thumb"
+			else
+				printf '%s\n' "$text"
+			fi
+		done \
+		| fuzzel --dmenu --index
+)" || exit 0   # fuzzel exits non-zero on Escape/cancel
+
+[ -n "${idx:-}" ] || exit 0
+
+# sed is 1-based; fuzzel's index is 0-based.
+id="$(printf '%s\n' "$ids" | sed -n "$((idx + 1))p")"
+[ -n "$id" ] || exit 1
+
+richclip restore "$id"
