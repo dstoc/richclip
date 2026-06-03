@@ -18,6 +18,7 @@ pub mod ipc;
 pub mod model;
 pub mod paths;
 pub mod store;
+pub mod thumbnail;
 
 // Convenience re-exports so callers don't have to spell out sub-modules.
 pub use error::{Error, Result};
