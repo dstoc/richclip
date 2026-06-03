@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "richclipd"
 path = "src/bin/richclipd.rs"
 
+[[bin]]
+name = "richclip"
+path = "src/bin/richclip.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 blake3 = "1.8.5"
