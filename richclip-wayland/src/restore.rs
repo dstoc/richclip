@@ -39,6 +39,7 @@ use wayland_client::{
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
+    zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
@@ -109,6 +110,15 @@ impl Dispatch<WlSeat, ()> for State {
 // ─── Dispatch<ZwlrDataControlDeviceV1, ()> ───────────────────────────────────
 
 impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
+    // The device's `data_offer` event (opcode 0) creates a child offer object.
+    // wayland-client requires this specialization even though a source-only
+    // restore provider ignores incoming offers — without it the queue panics
+    // ("Missing event_created_child specialization") the moment the compositor
+    // announces the current selection to our newly-created device.
+    wayland_client::event_created_child!(State, ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
+    ]);
+
     fn event(
         state: &mut Self,
         _device: &ZwlrDataControlDeviceV1,
@@ -129,6 +139,25 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 // relevant to a source-only restore provider.
             }
         }
+    }
+}
+
+// ─── Dispatch<ZwlrDataControlOfferV1, ()> ────────────────────────────────────
+
+// Offers belong to *other* clients' selections that the compositor announces to
+// our device. A source-only restore provider has no interest in them, but the
+// child object must still have a Dispatch impl so the queue can route (and
+// ignore) its `offer` events.
+impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _offer: &ZwlrDataControlOfferV1,
+        _event: zwlr_data_control_offer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Intentionally ignored.
     }
 }
 
