@@ -90,12 +90,32 @@ pub fn is_sensitive(offered_mimes: &[String]) -> bool {
     false
 }
 
+/// An accepted MIME type from a clipboard offer.
+///
+/// Capture needs two forms of the type:
+/// - [`offered`](Self::offered): the *exact* string the source advertised, which
+///   must be passed back verbatim to `receive()` — a source that only offered
+///   `text/plain;charset=utf-8` will not answer a `receive("text/plain")`.
+/// - [`store_as`](Self::store_as): the normalized lowercase base type (no `;`
+///   parameters) used as the stored MIME, so `decode <id> text/plain` and the
+///   `text/plain` label fallback work predictably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedMime {
+    /// Exact advertised type; pass to `receive()`.
+    pub offered: String,
+    /// Normalized base type; store under this.
+    pub store_as: String,
+}
+
 /// Returns the subset of `offered` MIMEs that are accepted by `config`,
-/// preserving offer order and deduplicating (first occurrence wins).
+/// preserving offer order and deduplicating by base type (first occurrence
+/// wins).
 ///
 /// A MIME is accepted when its base type (before `;`) is in
-/// `config.allowed_mimes`. The comparison is case-insensitive.
-pub fn accepted_mimes(config: &CaptureConfig, offered: &[String]) -> Vec<String> {
+/// `config.allowed_mimes`. The comparison is case-insensitive. Each result
+/// carries the original advertised string (for `receive`) and the normalized
+/// base type (for storage); see [`AcceptedMime`].
+pub fn accepted_mimes(config: &CaptureConfig, offered: &[String]) -> Vec<AcceptedMime> {
     let allowed_lower: Vec<String> =
         config.allowed_mimes.iter().map(|m| m.to_lowercase()).collect();
 
@@ -104,8 +124,11 @@ pub fn accepted_mimes(config: &CaptureConfig, offered: &[String]) -> Vec<String>
 
     for mime in offered {
         let base = mime_base_type(mime).to_lowercase();
-        if allowed_lower.contains(&base) && seen.insert(base) {
-            result.push(mime.clone());
+        if allowed_lower.contains(&base) && seen.insert(base.clone()) {
+            result.push(AcceptedMime {
+                offered: mime.clone(),
+                store_as: base,
+            });
         }
     }
 
@@ -159,18 +182,33 @@ mod tests {
 
     // ── accepted_mimes ────────────────────────────────────────────────────────
 
+    /// Helper: the `store_as` (normalized) types, in order.
+    fn store_as(offered: &[String]) -> Vec<String> {
+        accepted_mimes(&cfg(), offered)
+            .into_iter()
+            .map(|a| a.store_as)
+            .collect()
+    }
+
     #[test]
     fn accept_allowed_plain() {
         let offered = vec!["text/plain".into()];
-        assert_eq!(accepted_mimes(&cfg(), &offered), vec!["text/plain"]);
+        let result = accepted_mimes(&cfg(), &offered);
+        assert_eq!(result, vec![AcceptedMime {
+            offered: "text/plain".into(),
+            store_as: "text/plain".into(),
+        }]);
     }
 
     #[test]
     fn accept_charset_variant() {
-        // text/plain;charset=utf-8 → base type text/plain → accepted.
+        // text/plain;charset=utf-8 → received verbatim, stored as text/plain.
         let offered = vec!["text/plain;charset=utf-8".into()];
         let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec!["text/plain;charset=utf-8"]);
+        assert_eq!(result, vec![AcceptedMime {
+            offered: "text/plain;charset=utf-8".into(),
+            store_as: "text/plain".into(),
+        }]);
     }
 
     #[test]
@@ -187,31 +225,35 @@ mod tests {
 
     #[test]
     fn accept_image_png() {
-        let offered = vec!["image/png".into()];
-        assert_eq!(accepted_mimes(&cfg(), &offered), vec!["image/png"]);
+        assert_eq!(store_as(&["image/png".into()]), vec!["image/png"]);
     }
 
     #[test]
     fn accept_preserves_offer_order() {
         let offered = vec!["image/png".into(), "text/html".into(), "text/plain".into()];
-        let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec!["image/png", "text/html", "text/plain"]);
+        assert_eq!(store_as(&offered), vec!["image/png", "text/html", "text/plain"]);
     }
 
     #[test]
     fn deduplicates_same_base_type() {
-        // Two MIMEs with the same base type: first occurrence wins.
+        // Two MIMEs with the same base type: first occurrence wins (and the
+        // first one's advertised string is the one we'd receive).
         let offered = vec!["text/plain".into(), "text/plain;charset=utf-8".into()];
         let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec!["text/plain"]);
+        assert_eq!(result, vec![AcceptedMime {
+            offered: "text/plain".into(),
+            store_as: "text/plain".into(),
+        }]);
     }
 
     #[test]
     fn accept_case_insensitive() {
-        // MIME types are case-insensitive; we normalise before comparing.
-        let offered = vec!["TEXT/PLAIN".into()];
-        let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec!["TEXT/PLAIN"]);
+        // MIME types are case-insensitive; offered string preserved, stored lowercase.
+        let result = accepted_mimes(&cfg(), &["TEXT/PLAIN".into()]);
+        assert_eq!(result, vec![AcceptedMime {
+            offered: "TEXT/PLAIN".into(),
+            store_as: "text/plain".into(),
+        }]);
     }
 
     #[test]
@@ -222,8 +264,7 @@ mod tests {
             "image/jpeg".into(),
             "application/x-kde-klipper".into(),
         ];
-        let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec!["text/plain", "image/jpeg"]);
+        assert_eq!(store_as(&offered), vec!["text/plain", "image/jpeg"]);
     }
 
     // ── is_sensitive ──────────────────────────────────────────────────────────

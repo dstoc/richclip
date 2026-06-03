@@ -203,23 +203,29 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 let mut formats: Vec<CapturedFormat> = Vec::new();
                 let mut total_bytes: usize = 0;
 
-                for mime in &accepted {
-                    match drain_format(&state.conn, &offer, mime, &state.config, total_bytes) {
+                for am in &accepted {
+                    // Receive using the exact advertised type, store under the
+                    // normalized base type.
+                    match drain_format(&state.conn, &offer, &am.offered, &state.config, total_bytes) {
                         Ok(Some(bytes)) => {
                             total_bytes = total_bytes.saturating_add(bytes.len());
-                            formats.push(CapturedFormat { mime: mime.clone(), bytes });
+                            formats.push(CapturedFormat { mime: am.store_as.clone(), bytes });
                         }
                         Ok(None) => {
                             // Skipped due to size cap — also stop accepting more.
                             tracing::debug!(
-                                "Format {mime} skipped (size cap); stopping format drain"
+                                "Format {} skipped (size cap); stopping format drain",
+                                am.offered
                             );
                             break;
                         }
                         Err(e) => {
                             // I/O failure reading this format; skip it and try
                             // the next one rather than aborting the whole item.
-                            tracing::warn!("Failed to read format {mime}: {e}; skipping format");
+                            tracing::warn!(
+                                "Failed to read format {}: {e}; skipping format",
+                                am.offered
+                            );
                         }
                     }
                 }
