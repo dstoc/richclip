@@ -356,8 +356,12 @@ fn derive_label(store: &Store, id: Uuid) -> Option<String> {
         if let Ok(s) = std::str::from_utf8(&bytes) {
             let first_line = s.lines().next().unwrap_or("").trim();
             if !first_line.is_empty() {
-                let snippet = if first_line.len() > 60 {
-                    &first_line[..60]
+                // Truncate by char count (not byte index) to avoid panicking on
+                // multibyte UTF-8 boundaries.
+                let owned_snippet;
+                let snippet = if first_line.chars().count() > 60 {
+                    owned_snippet = first_line.chars().take(60).collect::<String>();
+                    owned_snippet.as_str()
                 } else {
                     first_line
                 };
