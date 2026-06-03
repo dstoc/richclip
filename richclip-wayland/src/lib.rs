@@ -6,6 +6,7 @@
 //! runtime is never blocked.
 
 pub mod capture;
+pub mod daemon;
 pub mod filter;
 
 pub use filter::CaptureConfig;

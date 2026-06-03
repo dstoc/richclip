@@ -724,9 +724,12 @@ name = "richclip-wayland"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
+ "predicates",
  "richclip",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tracing",

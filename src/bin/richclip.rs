@@ -1,12 +1,27 @@
 //! richclip — CLI frontend for the richclip clipboard history store.
 //!
-//! Commands: add, list, formats, decode, update, delete, inspect.
+//! Commands: add, list, formats, decode, update, delete, inspect, watch, restore.
 //! Global flag: `--data-dir <PATH>` (overrides RICHCLIP_DATA_DIR env var).
+//!
+//! ## Mutation routing
+//!
+//! When `richclipd` is running (detected by a successful connection to the IPC
+//! socket), `add`, `update`, and `delete` are routed through the daemon so that
+//! every mutation emits a `watch` event.  If no daemon is running they fall
+//! back to direct DB access (Phase-1 behaviour).
+//!
+//! Reads (`list`, `formats`, `inspect`, `decode`) always go direct to the DB
+//! (SQLite WAL mode allows concurrent readers).
 
 use clap::{Args, Parser, Subcommand};
 use richclip::{Error as LibError, Store};
+use richclip::ipc::{
+    AddItemParams, Request, Response, UpdateItemParams, WatchEventsParams,
+    client as ipc_client,
+};
 use serde::Serialize;
 use std::io::{Read as IoRead, Write as IoWrite};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -42,6 +57,10 @@ enum Command {
     Delete(DeleteArgs),
     /// Inspect full item record.
     Inspect(InspectArgs),
+    /// Watch live clipboard events (requires richclipd).
+    Watch(WatchArgs),
+    /// Restore an item as the active clipboard (requires richclipd).
+    Restore(RestoreArgs),
 }
 
 // --- add ---
@@ -143,6 +162,31 @@ struct InspectArgs {
     /// Output as JSON (default; always JSON for this command).
     #[arg(long)]
     json: bool,
+}
+
+// --- watch ---
+
+#[derive(Args)]
+struct WatchArgs {
+    /// Output raw JSON event lines (default: human-readable).
+    #[arg(long)]
+    json: bool,
+
+    /// Only show events of this type: item-added | item-updated | item-deleted.
+    #[arg(long, value_name = "EVENT")]
+    event: Option<String>,
+
+    /// Only show events for items that have this MIME type.
+    #[arg(long, value_name = "MIME")]
+    mime: Option<String>,
+}
+
+// --- restore ---
+
+#[derive(Args)]
+struct RestoreArgs {
+    /// Item ID.
+    id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +292,37 @@ fn open_store(data_dir: &Option<PathBuf>) -> Result<Store, AppError> {
         Store::open(&PathBuf::from(env_dir)).map_err(AppError::from)
     } else {
         Store::open_default().map_err(AppError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon socket helper
+// ---------------------------------------------------------------------------
+
+/// Attempt to connect to the daemon. Returns `Some(stream)` if a daemon is up.
+fn daemon_socket() -> Option<UnixStream> {
+    let path = if let Ok(v) = std::env::var("RICHCLIP_SOCKET") {
+        PathBuf::from(v)
+    } else {
+        richclip::paths::default_socket_path().ok()?
+    };
+    ipc_client::try_connect(&path)
+}
+
+/// Map an IPC `Response` to a CLI `Result`.  Non-ok responses become `AppError`.
+fn response_to_result(resp: Response) -> Result<Response, AppError> {
+    if resp.ok {
+        Ok(resp)
+    } else {
+        let code = resp.code.as_deref().unwrap_or("error");
+        // Map "not_found" to NotFound so the CLI exits 2.
+        if code == "not_found" {
+            Err(AppError::Lib(LibError::NotFound))
+        } else {
+            Err(AppError::Usage(
+                resp.error.unwrap_or_else(|| "unknown error".into()),
+            ))
+        }
     }
 }
 
@@ -426,6 +501,27 @@ fn cmd_add(cli_data_dir: &Option<PathBuf>, args: AddArgs) -> Result<(), AppError
     let srcs = parse_set_mime(&args.set_mime)?;
     let formats = resolve_mime_srcs(srcs)?;
 
+    // Try routing through the daemon first.
+    if let Some(mut stream) = daemon_socket() {
+        let req = Request::AddItem(AddItemParams {
+            formats: formats.clone(),
+        });
+        let resp = ipc_client::send_request(&mut stream, &req)
+            .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
+        let resp = response_to_result(resp)?;
+
+        let id_val = resp.data.as_ref()
+            .and_then(|d| d["id"].as_str())
+            .unwrap_or("");
+        if args.json {
+            println!("{}", serde_json::json!({"id": id_val}));
+        } else {
+            println!("{id_val}");
+        }
+        return Ok(());
+    }
+
+    // No daemon: direct DB write (Phase-1 fallback).
     let mut store = open_store(cli_data_dir)?;
     let id = store.add_item(&formats)?;
 
@@ -438,6 +534,7 @@ fn cmd_add(cli_data_dir: &Option<PathBuf>, args: AddArgs) -> Result<(), AppError
 }
 
 fn cmd_list(cli_data_dir: &Option<PathBuf>, args: ListArgs) -> Result<(), AppError> {
+    // Reads always go direct to the DB.
     let store = open_store(cli_data_dir)?;
     let items = store.list_items(args.limit, args.mime.as_deref())?;
 
@@ -509,6 +606,24 @@ fn cmd_update(cli_data_dir: &Option<PathBuf>, args: UpdateArgs) -> Result<(), Ap
     let srcs = parse_set_mime(&args.set_mime)?;
     let resolved = resolve_mime_srcs(srcs)?;
 
+    // Try routing through the daemon first.
+    if let Some(mut stream) = daemon_socket() {
+        let req = Request::UpdateItem(UpdateItemParams {
+            id,
+            set_formats: resolved.clone(),
+            remove_mimes: args.remove_mime.clone(),
+        });
+        let resp = ipc_client::send_request(&mut stream, &req)
+            .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
+        response_to_result(resp)?;
+
+        if args.json {
+            println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
+        }
+        return Ok(());
+    }
+
+    // No daemon: direct DB write.
     let mut store = open_store(cli_data_dir)?;
 
     // Apply removes first, then sets.
@@ -542,9 +657,7 @@ fn cmd_delete(cli_data_dir: &Option<PathBuf>, args: DeleteArgs) -> Result<(), Ap
     }
 
     if args.mime.is_some() && args.id.is_none() {
-        return Err(AppError::Usage(
-            "--mime requires an item <id>".into(),
-        ));
+        return Err(AppError::Usage("--mime requires an item <id>".into()));
     }
 
     if args.mime.is_some() && args.older_than.is_some() {
@@ -553,15 +666,15 @@ fn cmd_delete(cli_data_dir: &Option<PathBuf>, args: DeleteArgs) -> Result<(), Ap
         ));
     }
 
-    let mut store = open_store(cli_data_dir)?;
-
+    // --older-than: always goes direct to DB (bulk prune doesn't need IPC).
     if let Some(dur_str) = &args.older_than {
         let dur = humantime::parse_duration(dur_str).map_err(|e| {
             AppError::Usage(format!("invalid duration {:?}: {e}", dur_str))
         })?;
         let now = OffsetDateTime::now_utc();
-        let cutoff = now
-            - time::Duration::new(dur.as_secs() as i64, dur.subsec_nanos() as i32);
+        let cutoff =
+            now - time::Duration::new(dur.as_secs() as i64, dur.subsec_nanos() as i32);
+        let mut store = open_store(cli_data_dir)?;
         let count = store.delete_older_than(cutoff)?;
 
         if args.json {
@@ -575,15 +688,48 @@ fn cmd_delete(cli_data_dir: &Option<PathBuf>, args: DeleteArgs) -> Result<(), Ap
         return Ok(());
     }
 
-    // id is Some at this point (validated above).
+    // id is Some at this point.
     let id = parse_uuid(args.id.as_deref().unwrap())?;
 
-    if let Some(mime) = &args.mime {
+    // MIME removal: route through daemon (or direct) using UpdateItem/DeleteItem.
+    if let Some(ref mime) = args.mime {
+        // --mime: route via UpdateItem(remove_mimes=[mime]) or direct.
+        if let Some(mut stream) = daemon_socket() {
+            let req = Request::UpdateItem(UpdateItemParams {
+                id,
+                set_formats: vec![],
+                remove_mimes: vec![mime.clone()],
+            });
+            let resp = ipc_client::send_request(&mut stream, &req)
+                .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
+            response_to_result(resp)?;
+            if args.json {
+                println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
+            }
+            return Ok(());
+        }
+        let mut store = open_store(cli_data_dir)?;
         store.remove_format(id, mime)?;
-    } else {
-        store.delete_item(id)?;
+        if args.json {
+            println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
+        }
+        return Ok(());
     }
 
+    // Full item delete: route through daemon.
+    if let Some(mut stream) = daemon_socket() {
+        let req = Request::DeleteItem { id };
+        let resp = ipc_client::send_request(&mut stream, &req)
+            .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
+        response_to_result(resp)?;
+        if args.json {
+            println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
+        }
+        return Ok(());
+    }
+
+    let mut store = open_store(cli_data_dir)?;
+    store.delete_item(id)?;
     if args.json {
         println!("{}", serde_json::to_string(&OkOutput { ok: true }).unwrap());
     }
@@ -613,6 +759,59 @@ fn cmd_inspect(cli_data_dir: &Option<PathBuf>, args: InspectArgs) -> Result<(), 
     Ok(())
 }
 
+fn cmd_watch(args: WatchArgs) -> Result<(), AppError> {
+    let stream = daemon_socket().ok_or_else(|| {
+        AppError::Usage("richclipd is not running; start the daemon first".into())
+    })?;
+
+    let req = Request::WatchEvents(WatchEventsParams {
+        event_filter: args.event.clone(),
+        mime_filter: args.mime.clone(),
+    });
+
+    let iter = ipc_client::watch_events(stream, &req)
+        .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
+
+    for event in iter {
+        if args.json {
+            // Print the raw JSON line.
+            let line = serde_json::to_string(&event)
+                .unwrap_or_else(|_| String::from("{\"error\":\"serialize\"}"));
+            println!("{line}");
+        } else {
+            // Human-readable short line.
+            use richclip::ipc::WatchEvent;
+            match &event {
+                WatchEvent::ItemAdded { id, formats, .. } => {
+                    println!("item-added {} {}", id, formats.join(", "));
+                }
+                WatchEvent::ItemUpdated { id, changed } => {
+                    println!("item-updated {} changed: {}", id, changed.join(", "));
+                }
+                WatchEvent::ItemDeleted { id } => {
+                    println!("item-deleted {}", id);
+                }
+            }
+        }
+        // Flush so piped consumers see events immediately.
+        let _ = std::io::stdout().flush();
+    }
+    Ok(())
+}
+
+fn cmd_restore(args: RestoreArgs) -> Result<(), AppError> {
+    let id = parse_uuid(&args.id)?;
+    let mut stream = daemon_socket().ok_or_else(|| {
+        AppError::Usage("richclipd is not running; start the daemon first".into())
+    })?;
+
+    let req = Request::RestoreItem { id };
+    let resp = ipc_client::send_request(&mut stream, &req)
+        .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
+    response_to_result(resp)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -628,6 +827,8 @@ fn run() -> Result<(), AppError> {
         Command::Update(args) => cmd_update(&cli.data_dir, args),
         Command::Delete(args) => cmd_delete(&cli.data_dir, args),
         Command::Inspect(args) => cmd_inspect(&cli.data_dir, args),
+        Command::Watch(args) => cmd_watch(args),
+        Command::Restore(args) => cmd_restore(args),
     }
 }
 
