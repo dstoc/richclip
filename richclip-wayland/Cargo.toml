@@ -1,0 +1,17 @@
+[package]
+name = "richclip-wayland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+richclip = { path = ".." }
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+time = { version = "0.3.47", features = ["formatting", "parsing", "serde-well-known"] }
+uuid = { version = "1.23.2", features = ["v7", "serde"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wayland-client = "0.31.14"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }

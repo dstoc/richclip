@@ -1,3 +1,7 @@
+[workspace]
+members = ["richclip-wayland"]
+resolver = "3"
+
 [package]
 name = "richclip"
 version = "0.1.0"
@@ -6,10 +10,6 @@ edition = "2024"
 [lib]
 name = "richclip"
 path = "src/lib.rs"
-
-[[bin]]
-name = "richclipd"
-path = "src/bin/richclipd.rs"
 
 [[bin]]
 name = "richclip"
@@ -26,12 +26,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting", "parsing", "serde-well-known"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.2", features = ["v7", "serde"] }
-wayland-client = "0.31.14"
-wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

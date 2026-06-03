@@ -716,6 +716,18 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "richclip-wayland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "richclip",
+ "serde",
+ "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
