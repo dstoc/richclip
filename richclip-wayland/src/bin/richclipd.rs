@@ -224,7 +224,13 @@ async fn main() -> anyhow::Result<()> {
     // Clean up socket file on exit.
     let _ = std::fs::remove_file(&socket_path_for_cleanup);
     info!("richclipd exited cleanly");
-    Ok(())
+
+    // The Wayland capture loop runs on a `spawn_blocking` thread whose
+    // `blocking_dispatch()` never returns while the compositor is connected.
+    // Blocking tasks can't be cancelled, and dropping the tokio runtime blocks
+    // until they finish — so returning here would hang in runtime shutdown.
+    // Terminate explicitly now that cleanup is done.
+    std::process::exit(0)
 }
 
 // ---------------------------------------------------------------------------
