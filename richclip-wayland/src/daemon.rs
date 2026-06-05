@@ -21,10 +21,10 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
+use richclip::Store;
 use richclip::ipc::{
     AddItemParams, Request, Response, UpdateItemParams, WatchEvent, WatchEventsParams,
 };
-use richclip::Store;
 
 // ---------------------------------------------------------------------------
 // Shared daemon state
@@ -100,8 +100,8 @@ async fn handle_conn_inner(stream: UnixStream, state: DaemonState) -> anyhow::Re
         return Ok(()); // client disconnected before sending anything
     }
 
-    let request: Request = serde_json::from_str(request_line.trim())
-        .context("failed to parse request")?;
+    let request: Request =
+        serde_json::from_str(request_line.trim()).context("failed to parse request")?;
 
     match request {
         Request::AddItem(p) => {

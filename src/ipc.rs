@@ -183,10 +183,7 @@ pub mod client {
     ///
     /// The returned iterator borrows the stream; the caller should hold the
     /// stream alive as long as events are needed and drop it to stop watching.
-    pub fn watch_events(
-        stream: UnixStream,
-        request: &Request,
-    ) -> std::io::Result<WatchIter> {
+    pub fn watch_events(stream: UnixStream, request: &Request) -> std::io::Result<WatchIter> {
         let mut write_half = stream.try_clone()?;
         let mut line = serde_json::to_string(request)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

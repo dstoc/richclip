@@ -14,11 +14,10 @@
 //! (SQLite WAL mode allows concurrent readers).
 
 use clap::{Args, Parser, Subcommand};
-use richclip::{Error as LibError, Store};
 use richclip::ipc::{
-    AddItemParams, Request, Response, UpdateItemParams, WatchEventsParams,
-    client as ipc_client,
+    AddItemParams, Request, Response, UpdateItemParams, WatchEventsParams, client as ipc_client,
 };
+use richclip::{Error as LibError, Store};
 use serde::Serialize;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::os::unix::net::UnixStream;
@@ -392,8 +391,7 @@ fn parse_set_mime(args: &[String]) -> Result<Vec<MimeSrc>, AppError> {
             stdin_count += 1;
             if stdin_count > 1 {
                 return Err(AppError::Usage(
-                    "at most one --set-mime source may be '-' (stdin can only be read once)"
-                        .into(),
+                    "at most one --set-mime source may be '-' (stdin can only be read once)".into(),
                 ));
             }
             entries.push(MimeSrc::Stdin(mime.to_string()));
@@ -427,9 +425,8 @@ fn resolve_mime_srcs(srcs: Vec<MimeSrc>) -> Result<Vec<(String, Vec<u8>)>, AppEr
     for src in srcs {
         match src {
             MimeSrc::File(mime, path) => {
-                let bytes = std::fs::read(&path).map_err(|e| {
-                    AppError::Usage(format!("failed to read {:?}: {e}", path))
-                })?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| AppError::Usage(format!("failed to read {:?}: {e}", path)))?;
                 result.push((mime, bytes));
             }
             MimeSrc::Stdin(mime) => {
@@ -539,7 +536,9 @@ fn cmd_add(cli_data_dir: &Option<PathBuf>, args: AddArgs) -> Result<(), AppError
             .map_err(|e| AppError::Usage(format!("IPC error: {e}")))?;
         let resp = response_to_result(resp)?;
 
-        let id_val = resp.data.as_ref()
+        let id_val = resp
+            .data
+            .as_ref()
             .and_then(|d| d["id"].as_str())
             .unwrap_or("");
         if args.json {
@@ -722,12 +721,10 @@ fn cmd_delete(cli_data_dir: &Option<PathBuf>, args: DeleteArgs) -> Result<(), Ap
 
     // --older-than: always goes direct to DB (bulk prune doesn't need IPC).
     if let Some(dur_str) = &args.older_than {
-        let dur = humantime::parse_duration(dur_str).map_err(|e| {
-            AppError::Usage(format!("invalid duration {:?}: {e}", dur_str))
-        })?;
+        let dur = humantime::parse_duration(dur_str)
+            .map_err(|e| AppError::Usage(format!("invalid duration {:?}: {e}", dur_str)))?;
         let now = OffsetDateTime::now_utc();
-        let cutoff =
-            now - time::Duration::new(dur.as_secs() as i64, dur.subsec_nanos() as i32);
+        let cutoff = now - time::Duration::new(dur.as_secs() as i64, dur.subsec_nanos() as i32);
         let mut store = open_store(cli_data_dir)?;
         let count = store.delete_older_than(cutoff)?;
 

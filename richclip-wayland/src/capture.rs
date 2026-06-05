@@ -35,7 +35,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
 };
 
-use richclip::backend::{CapturedFormat, CapturedItem, CaptureSink};
+use richclip::backend::{CaptureSink, CapturedFormat, CapturedItem};
 
 use crate::filter::{self, CaptureConfig};
 
@@ -55,7 +55,6 @@ struct State {
 
     /// The connection handle; stored so `Dispatch` impls can call `flush()`.
     conn: Connection,
-
     // TODO (P2-M4 restore milestone): When the daemon owns the current
     // selection (after a `restore_item` call), record the source object ID
     // here so that `Selection` events for that offer can be short-circuited
@@ -173,7 +172,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
 
                 // ── Sensitivity check (before allowlist) ──────────────────────
                 if filter::is_sensitive(&mimes) {
-                    tracing::debug!("Skipping sensitive clipboard offer (mime hints: {:?})", mimes);
+                    tracing::debug!(
+                        "Skipping sensitive clipboard offer (mime hints: {:?})",
+                        mimes
+                    );
                     // Clean up.
                     state.offers.remove(&offer.id());
                     return;
@@ -206,10 +208,14 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 for am in &accepted {
                     // Receive using the exact advertised type, store under the
                     // normalized base type.
-                    match drain_format(&state.conn, &offer, &am.offered, &state.config, total_bytes) {
+                    match drain_format(&state.conn, &offer, &am.offered, &state.config, total_bytes)
+                    {
                         Ok(Some(bytes)) => {
                             total_bytes = total_bytes.saturating_add(bytes.len());
-                            formats.push(CapturedFormat { mime: am.store_as.clone(), bytes });
+                            formats.push(CapturedFormat {
+                                mime: am.store_as.clone(),
+                                bytes,
+                            });
                         }
                         Ok(None) => {
                             // Skipped due to size cap — also stop accepting more.

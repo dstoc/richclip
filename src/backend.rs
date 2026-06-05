@@ -32,7 +32,9 @@ impl CaptureSink {
     /// Create a sink backed by `handler`. The handler is called once per
     /// completed clipboard selection, on whatever thread the capture loop runs.
     pub fn new(handler: impl FnMut(CapturedItem) + Send + 'static) -> Self {
-        Self { handler: Box::new(handler) }
+        Self {
+            handler: Box::new(handler),
+        }
     }
 
     /// Deliver a captured item to the handler.

@@ -21,8 +21,7 @@ pub fn to_epoch_ms(dt: OffsetDateTime) -> i64 {
 pub fn from_epoch_ms(ms: i64) -> OffsetDateTime {
     // from_unix_timestamp_nanos accepts i128 nanoseconds.
     let nanos = (ms as i128) * 1_000_000;
-    OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+    OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
 // ---------------------------------------------------------------------------
@@ -144,11 +143,7 @@ pub fn require_item(conn: &Connection, id: Uuid) -> Result<()> {
         )
         .optional()?
         .unwrap_or(false);
-    if exists {
-        Ok(())
-    } else {
-        Err(Error::NotFound)
-    }
+    if exists { Ok(()) } else { Err(Error::NotFound) }
 }
 
 /// Fetch a single item by id.
@@ -212,9 +207,7 @@ pub fn list_items(
         v
     } else {
         let sql = match limit {
-            Some(l) => format!(
-                "SELECT id FROM items ORDER BY id DESC LIMIT {l}"
-            ),
+            Some(l) => format!("SELECT id FROM items ORDER BY id DESC LIMIT {l}"),
             None => "SELECT id FROM items ORDER BY id DESC".to_string(),
         };
         let mut stmt = conn.prepare(&sql)?;
@@ -272,9 +265,7 @@ pub fn delete_format_row(conn: &Connection, id: Uuid, mime: &str) -> Result<Stri
 /// Delete all format rows for an item; returns each distinct blob_hash that
 /// was referenced.
 pub fn delete_formats_for_item(conn: &Connection, id: Uuid) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT blob_hash FROM formats WHERE item_id = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT DISTINCT blob_hash FROM formats WHERE item_id = ?1")?;
     let hashes: Vec<String> = stmt
         .query_map(params![id.hyphenated().to_string()], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -292,9 +283,7 @@ pub fn delete_items_older_than(
     cutoff_ms: i64,
 ) -> Result<(Vec<String>, Vec<String>)> {
     // Collect ids to delete.
-    let mut stmt = conn.prepare(
-        "SELECT id FROM items WHERE created_at < ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT id FROM items WHERE created_at < ?1")?;
     let ids: Vec<String> = stmt
         .query_map(params![cutoff_ms], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -306,9 +295,8 @@ pub fn delete_items_older_than(
     // Collect blob hashes for those items.
     let mut hashes: Vec<String> = Vec::new();
     for id_str in &ids {
-        let mut h_stmt = conn.prepare(
-            "SELECT DISTINCT blob_hash FROM formats WHERE item_id = ?1",
-        )?;
+        let mut h_stmt =
+            conn.prepare("SELECT DISTINCT blob_hash FROM formats WHERE item_id = ?1")?;
         let hs: Vec<String> = h_stmt
             .query_map(params![id_str], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;

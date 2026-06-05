@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     if socket_path.exists() {
         // Try to connect. If a daemon answers, bail out.
         if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
-            use richclip::ipc::{Request, ListItemsParams};
+            use richclip::ipc::{ListItemsParams, Request};
             // Send a lightweight request to probe liveness.
             let probe = Request::ListItems(ListItemsParams {
                 limit: Some(0),
@@ -82,10 +82,7 @@ async fn main() -> anyhow::Result<()> {
             line.push('\n');
             use std::io::Write;
             if stream.write_all(line.as_bytes()).is_ok() {
-                tracing::error!(
-                    "richclipd is already running on {:?}; exiting",
-                    socket_path
-                );
+                tracing::error!("richclipd is already running on {:?}; exiting", socket_path);
                 std::process::exit(1);
             }
         }
@@ -110,8 +107,7 @@ async fn main() -> anyhow::Result<()> {
     // ── 6. Spawn capture task (best-effort; skip if no compositor) ────────────
     {
         let state_cap = state.clone();
-        let (cap_tx, mut cap_rx) =
-            tokio::sync::mpsc::unbounded_channel::<CapturedItem>();
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedItem>();
 
         // Spawn the Wayland capture loop in a blocking thread.
         tokio::spawn(async move {
@@ -161,8 +157,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut store = state_cap.store.lock().await;
                 match store.add_item(&formats) {
                     Ok(id) => {
-                        let mimes: Vec<String> =
-                            formats.iter().map(|(m, _)| m.clone()).collect();
+                        let mimes: Vec<String> = formats.iter().map(|(m, _)| m.clone()).collect();
                         let created_at = match store.get_item(id) {
                             Ok(iwf) => iwf.item.created_at,
                             Err(_) => time::OffsetDateTime::now_utc(),
@@ -251,8 +246,7 @@ async fn accept_loop(listener: UnixListener, state: DaemonState) -> anyhow::Resu
 // ---------------------------------------------------------------------------
 
 async fn prune_old_items(store: &Arc<Mutex<Store>>, retention_days: u64) {
-    let cutoff = time::OffsetDateTime::now_utc()
-        - time::Duration::days(retention_days as i64);
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(retention_days as i64);
     let mut store = store.lock().await;
     match store.delete_older_than(cutoff) {
         Ok(0) => {}

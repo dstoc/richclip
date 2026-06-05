@@ -118,7 +118,10 @@ fn test_add_file_decode_roundtrip() {
         .stdout
         .clone();
 
-    assert_eq!(decoded, binary_content, "decoded bytes must match file bytes exactly");
+    assert_eq!(
+        decoded, binary_content,
+        "decoded bytes must match file bytes exactly"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +308,10 @@ fn test_blob_dedup() {
     let hash1 = v1["formats"][0]["blob_hash"].as_str().unwrap();
     let hash2 = v2["formats"][0]["blob_hash"].as_str().unwrap();
 
-    assert_eq!(hash1, hash2, "identical content must share the same blob_hash");
+    assert_eq!(
+        hash1, hash2,
+        "identical content must share the same blob_hash"
+    );
     assert!(!hash1.is_empty(), "blob_hash must not be empty");
 }
 
@@ -320,10 +326,7 @@ fn test_delete_item_cleanup() {
     let id = add_text_plain(&dir, "to be deleted");
 
     // delete the item
-    cmd(&dir)
-        .args(["delete", &id])
-        .assert()
-        .success();
+    cmd(&dir).args(["delete", &id]).assert().success();
 
     // decode → exit 2
     cmd(&dir)
@@ -332,10 +335,7 @@ fn test_delete_item_cleanup() {
         .code(2);
 
     // inspect → exit 2
-    cmd(&dir)
-        .args(["inspect", &id])
-        .assert()
-        .code(2);
+    cmd(&dir).args(["inspect", &id]).assert().code(2);
 
     // list --json returns []
     let list_out = cmd(&dir)
@@ -417,7 +417,10 @@ fn test_delete_older_than() {
 
     let v: serde_json::Value = serde_json::from_slice(&delete_out).unwrap();
     let deleted = v["deleted"].as_u64().unwrap();
-    assert!(deleted >= 2, "must have deleted at least the 2 items we added, got {deleted}");
+    assert!(
+        deleted >= 2,
+        "must have deleted at least the 2 items we added, got {deleted}"
+    );
 
     // list must now be empty
     let list_out = cmd(&dir)
@@ -428,7 +431,10 @@ fn test_delete_older_than() {
         .stdout
         .clone();
     let items: Vec<serde_json::Value> = serde_json::from_slice(&list_out).unwrap();
-    assert!(items.is_empty(), "list must be empty after delete --older-than");
+    assert!(
+        items.is_empty(),
+        "list must be empty after delete --older-than"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +458,12 @@ fn test_derived_label_richclip_label() {
 
     // Set the richclip label
     cmd(&dir)
-        .args(["update", &id, "--set-mime", "application/x-richclip-label=-"])
+        .args([
+            "update",
+            &id,
+            "--set-mime",
+            "application/x-richclip-label=-",
+        ])
         .write_stdin("screenshot of rust panic")
         .assert()
         .success();
@@ -489,7 +500,10 @@ fn test_label_fallback_text_plain() {
         .clone();
 
     let items: Vec<serde_json::Value> = serde_json::from_slice(&list_out).unwrap();
-    let item = items.iter().find(|i| i["id"].as_str().unwrap() == id).unwrap();
+    let item = items
+        .iter()
+        .find(|i| i["id"].as_str().unwrap() == id)
+        .unwrap();
     let label = item["label"].as_str().expect("label must be non-null");
     assert!(!label.is_empty(), "label must be non-empty");
     // The label should be a snippet of the text/plain content
@@ -508,7 +522,11 @@ fn test_error_contract_human_not_found() {
     let dir = TempDir::new().unwrap();
 
     cmd(&dir)
-        .args(["decode", "00000000-0000-0000-0000-000000000000", "text/plain"])
+        .args([
+            "decode",
+            "00000000-0000-0000-0000-000000000000",
+            "text/plain",
+        ])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("not found"));
@@ -624,7 +642,10 @@ fn test_derive_label_multibyte_no_panic() {
         .clone();
 
     let items: Vec<serde_json::Value> = serde_json::from_slice(&list_out).unwrap();
-    let item = items.iter().find(|i| i["id"].as_str().unwrap() == id).unwrap();
+    let item = items
+        .iter()
+        .find(|i| i["id"].as_str().unwrap() == id)
+        .unwrap();
     let label = item["label"].as_str().expect("label must be non-null");
 
     // Must be exactly 60 chars (truncated at char boundary, not byte boundary)

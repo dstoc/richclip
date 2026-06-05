@@ -141,12 +141,21 @@ mod tests {
 
         let (tw, th) = (thumb.width(), thumb.height());
         // Longest edge must be <= 256.
-        assert!(tw <= 256 && th <= 256, "dimensions {tw}x{th} exceed max_edge");
+        assert!(
+            tw <= 256 && th <= 256,
+            "dimensions {tw}x{th} exceed max_edge"
+        );
         // At least one edge should be exactly 256 (it's the longest edge of the
         // result when we hit the bound).
-        assert!(tw == 256 || th == 256, "expected longest edge == 256, got {tw}x{th}");
+        assert!(
+            tw == 256 || th == 256,
+            "expected longest edge == 256, got {tw}x{th}"
+        );
         // Dimensions must be strictly smaller than the original.
-        assert!(tw < 800 && th < 600, "thumbnail was not smaller than original");
+        assert!(
+            tw < 800 && th < 600,
+            "thumbnail was not smaller than original"
+        );
         // Aspect ratio preserved within rounding: original is 4:3.
         let orig_ratio = 800.0_f64 / 600.0;
         let thumb_ratio = tw as f64 / th as f64;
@@ -190,10 +199,7 @@ mod tests {
         // Longest edge is width — must now be 256.
         assert_eq!(tw, 256, "longest edge should be 256, got {tw}");
         // Shorter edge: 100 * (256/400) = 64.
-        assert!(
-            (th as i64 - 64).abs() <= 1,
-            "expected height ~64, got {th}"
-        );
+        assert!((th as i64 - 64).abs() <= 1, "expected height ~64, got {th}");
     }
 
     // -------------------------------------------------------------------------

@@ -35,7 +35,7 @@ impl Default for CaptureConfig {
                 "application/json".into(),
                 "application/rtf".into(),
             ],
-            max_item_bytes: 8 * 1024 * 1024,  // 8 MiB
+            max_item_bytes: 8 * 1024 * 1024,   // 8 MiB
             max_format_bytes: 4 * 1024 * 1024, // 4 MiB
         }
     }
@@ -116,8 +116,11 @@ pub struct AcceptedMime {
 /// carries the original advertised string (for `receive`) and the normalized
 /// base type (for storage); see [`AcceptedMime`].
 pub fn accepted_mimes(config: &CaptureConfig, offered: &[String]) -> Vec<AcceptedMime> {
-    let allowed_lower: Vec<String> =
-        config.allowed_mimes.iter().map(|m| m.to_lowercase()).collect();
+    let allowed_lower: Vec<String> = config
+        .allowed_mimes
+        .iter()
+        .map(|m| m.to_lowercase())
+        .collect();
 
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
@@ -142,7 +145,11 @@ pub fn accepted_mimes(config: &CaptureConfig, offered: &[String]) -> Vec<Accepte
 /// - If `format_bytes > config.max_format_bytes` the format is dropped.
 /// - If `current_total + format_bytes > config.max_item_bytes` the format is
 ///   dropped and no further formats should be accepted for this item.
-pub fn within_size_limits(config: &CaptureConfig, current_total: usize, format_bytes: usize) -> bool {
+pub fn within_size_limits(
+    config: &CaptureConfig,
+    current_total: usize,
+    format_bytes: usize,
+) -> bool {
     if format_bytes > config.max_format_bytes {
         return false;
     }
@@ -194,10 +201,13 @@ mod tests {
     fn accept_allowed_plain() {
         let offered = vec!["text/plain".into()];
         let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec![AcceptedMime {
-            offered: "text/plain".into(),
-            store_as: "text/plain".into(),
-        }]);
+        assert_eq!(
+            result,
+            vec![AcceptedMime {
+                offered: "text/plain".into(),
+                store_as: "text/plain".into(),
+            }]
+        );
     }
 
     #[test]
@@ -205,10 +215,13 @@ mod tests {
         // text/plain;charset=utf-8 → received verbatim, stored as text/plain.
         let offered = vec!["text/plain;charset=utf-8".into()];
         let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec![AcceptedMime {
-            offered: "text/plain;charset=utf-8".into(),
-            store_as: "text/plain".into(),
-        }]);
+        assert_eq!(
+            result,
+            vec![AcceptedMime {
+                offered: "text/plain;charset=utf-8".into(),
+                store_as: "text/plain".into(),
+            }]
+        );
     }
 
     #[test]
@@ -231,7 +244,10 @@ mod tests {
     #[test]
     fn accept_preserves_offer_order() {
         let offered = vec!["image/png".into(), "text/html".into(), "text/plain".into()];
-        assert_eq!(store_as(&offered), vec!["image/png", "text/html", "text/plain"]);
+        assert_eq!(
+            store_as(&offered),
+            vec!["image/png", "text/html", "text/plain"]
+        );
     }
 
     #[test]
@@ -240,20 +256,26 @@ mod tests {
         // first one's advertised string is the one we'd receive).
         let offered = vec!["text/plain".into(), "text/plain;charset=utf-8".into()];
         let result = accepted_mimes(&cfg(), &offered);
-        assert_eq!(result, vec![AcceptedMime {
-            offered: "text/plain".into(),
-            store_as: "text/plain".into(),
-        }]);
+        assert_eq!(
+            result,
+            vec![AcceptedMime {
+                offered: "text/plain".into(),
+                store_as: "text/plain".into(),
+            }]
+        );
     }
 
     #[test]
     fn accept_case_insensitive() {
         // MIME types are case-insensitive; offered string preserved, stored lowercase.
         let result = accepted_mimes(&cfg(), &["TEXT/PLAIN".into()]);
-        assert_eq!(result, vec![AcceptedMime {
-            offered: "TEXT/PLAIN".into(),
-            store_as: "text/plain".into(),
-        }]);
+        assert_eq!(
+            result,
+            vec![AcceptedMime {
+                offered: "TEXT/PLAIN".into(),
+                store_as: "text/plain".into(),
+            }]
+        );
     }
 
     #[test]
@@ -296,7 +318,10 @@ mod tests {
     #[test]
     fn not_sensitive_nautilus_clipboard() {
         // application/x-nautilus-clipboard must NOT be flagged as sensitive.
-        let mimes = vec!["application/x-nautilus-clipboard".into(), "text/plain".into()];
+        let mimes = vec![
+            "application/x-nautilus-clipboard".into(),
+            "text/plain".into(),
+        ];
         assert!(!is_sensitive(&mimes));
     }
 

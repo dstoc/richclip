@@ -333,7 +333,10 @@ mod tests {
         let id = store
             .add_item(&[
                 ("image/png".to_string(), b"PNG_DATA".to_vec()),
-                ("application/x-richclip-label".to_string(), b"a label".to_vec()),
+                (
+                    "application/x-richclip-label".to_string(),
+                    b"a label".to_vec(),
+                ),
             ])
             .unwrap();
 
@@ -391,7 +394,9 @@ mod tests {
             .add_item(&[("text/plain".to_string(), b"hello".to_vec())])
             .unwrap();
 
-        store.set_format(id, "text/html", b"<em>hello</em>").unwrap();
+        store
+            .set_format(id, "text/html", b"<em>hello</em>")
+            .unwrap();
 
         let fmts = store.formats(id).unwrap();
         assert_eq!(fmts.len(), 2);
@@ -515,7 +520,10 @@ mod tests {
 
         // Clean up id2 to verify the blob is now removable.
         store.delete_item(id2).unwrap();
-        assert!(!path.exists(), "blob must be removed when last reference gone");
+        assert!(
+            !path.exists(),
+            "blob must be removed when last reference gone"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -558,10 +566,13 @@ mod tests {
             // Use a cutoff that is one second after epoch — very far in the past.
             // We'll manipulate the db directly.
             let old_ms: i64 = 1_000; // epoch + 1s
-            store.conn.execute(
-                "UPDATE items SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![old_ms, id.hyphenated().to_string()],
-            ).unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE items SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![old_ms, id.hyphenated().to_string()],
+                )
+                .unwrap();
             id
         };
 

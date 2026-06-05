@@ -122,7 +122,9 @@ fn test_list_json_thumbnail_field_image() {
     let item = &items[0];
 
     // The thumbnail field must be the path string.
-    let thumb_val = item["thumbnail"].as_str().expect("thumbnail must be a string for image items");
+    let thumb_val = item["thumbnail"]
+        .as_str()
+        .expect("thumbnail must be a string for image items");
     assert_eq!(
         thumb_val,
         expected_thumb.to_string_lossy().as_ref(),
@@ -197,7 +199,10 @@ fn test_thumbnail_subcommand_image() {
     if thumb.exists() {
         std::fs::remove_file(&thumb).unwrap();
     }
-    assert!(!thumb.exists(), "thumb must be removed before subcommand test");
+    assert!(
+        !thumb.exists(),
+        "thumb must be removed before subcommand test"
+    );
 
     // Run `richclip thumbnail <id>` — must print the path.
     let out = cmd(&data_dir, &cache_dir)
@@ -220,7 +225,10 @@ fn test_thumbnail_subcommand_image() {
     );
 
     // File must now exist.
-    assert!(thumb.exists(), "thumb file must exist after thumbnail subcommand");
+    assert!(
+        thumb.exists(),
+        "thumb file must exist after thumbnail subcommand"
+    );
 
     // Verify it is a valid PNG.
     let bytes = std::fs::read(&thumb).unwrap();

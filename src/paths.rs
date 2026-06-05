@@ -25,7 +25,9 @@ pub fn default_cache_dir() -> Result<PathBuf> {
 
 /// Return the path for an item's thumbnail: `<cache_dir>/thumbs/<id>.png`.
 pub fn thumb_path(cache_dir: &Path, id: Uuid) -> PathBuf {
-    cache_dir.join("thumbs").join(format!("{}.png", id.hyphenated()))
+    cache_dir
+        .join("thumbs")
+        .join(format!("{}.png", id.hyphenated()))
 }
 
 /// Return the default runtime directory for the daemon socket:

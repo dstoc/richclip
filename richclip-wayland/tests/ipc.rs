@@ -70,11 +70,7 @@ fn start_daemon(data_dir: &TempDir, socket: &std::path::Path) -> DaemonGuard {
 // Helper: run `richclip <args>` with the test's data dir and socket.
 // ---------------------------------------------------------------------------
 
-fn richclip(
-    data_dir: &TempDir,
-    socket: &std::path::Path,
-    args: &[&str],
-) -> std::process::Output {
+fn richclip(data_dir: &TempDir, socket: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::cargo_bin("richclip")
         .expect("richclip binary not found")
         .env("RICHCLIP_DATA_DIR", data_dir.path())
@@ -105,12 +101,7 @@ fn richclip_stdin(
         .spawn()
         .expect("failed to spawn richclip");
 
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin_data)
-        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(stdin_data).unwrap();
     drop(child.stdin.take());
 
     child.wait_with_output().expect("richclip did not finish")
@@ -141,7 +132,10 @@ fn test_ipc_full_flow() {
         "add failed: {:?}",
         String::from_utf8_lossy(&add_out.stderr)
     );
-    let id = String::from_utf8(add_out.stdout).unwrap().trim().to_string();
+    let id = String::from_utf8(add_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert_eq!(id.len(), 36, "expected UUID-length id, got {:?}", id);
 
     // ── list --json (direct DB read) shows the item ──────────────────────────
@@ -246,8 +240,7 @@ fn test_ipc_full_flow() {
     // First delete the id2 (second item).
     {
         let list2_out = richclip(&data_dir, &socket, &["list", "--json"]);
-        let all: Vec<serde_json::Value> =
-            serde_json::from_slice(&list2_out.stdout).unwrap();
+        let all: Vec<serde_json::Value> = serde_json::from_slice(&list2_out.stdout).unwrap();
         for item in all {
             let del_id = item["id"].as_str().unwrap();
             let del_out = richclip(&data_dir, &socket, &["delete", del_id]);
@@ -262,9 +255,11 @@ fn test_ipc_full_flow() {
 
     let final_list = richclip(&data_dir, &socket, &["list", "--json"]);
     assert!(final_list.status.success());
-    let remaining: Vec<serde_json::Value> =
-        serde_json::from_slice(&final_list.stdout).unwrap();
-    assert!(remaining.is_empty(), "list must be empty after deleting all items");
+    let remaining: Vec<serde_json::Value> = serde_json::from_slice(&final_list.stdout).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "list must be empty after deleting all items"
+    );
 
     // ── single-instance: second richclipd on same socket exits non-zero ───────
     {
