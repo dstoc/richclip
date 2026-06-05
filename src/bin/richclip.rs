@@ -446,31 +446,31 @@ fn resolve_mime_srcs(srcs: Vec<MimeSrc>) -> Result<Vec<(String, Vec<u8>)>, AppEr
 
 fn derive_label(store: &Store, id: Uuid) -> Option<String> {
     // Try application/x-richclip-label first.
-    if let Ok(bytes) = store.decode(id, "application/x-richclip-label") {
-        if let Ok(s) = std::str::from_utf8(&bytes) {
-            let trimmed = s.trim().to_string();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
+    if let Ok(bytes) = store.decode(id, "application/x-richclip-label")
+        && let Ok(s) = std::str::from_utf8(&bytes)
+    {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
         }
     }
 
     // Fall back to text/plain snippet.
-    if let Ok(bytes) = store.decode(id, "text/plain") {
-        if let Ok(s) = std::str::from_utf8(&bytes) {
-            let first_line = s.lines().next().unwrap_or("").trim();
-            if !first_line.is_empty() {
-                // Truncate by char count (not byte index) to avoid panicking on
-                // multibyte UTF-8 boundaries.
-                let owned_snippet;
-                let snippet = if first_line.chars().count() > 60 {
-                    owned_snippet = first_line.chars().take(60).collect::<String>();
-                    owned_snippet.as_str()
-                } else {
-                    first_line
-                };
-                return Some(snippet.to_string());
-            }
+    if let Ok(bytes) = store.decode(id, "text/plain")
+        && let Ok(s) = std::str::from_utf8(&bytes)
+    {
+        let first_line = s.lines().next().unwrap_or("").trim();
+        if !first_line.is_empty() {
+            // Truncate by char count (not byte index) to avoid panicking on
+            // multibyte UTF-8 boundaries.
+            let owned_snippet;
+            let snippet = if first_line.chars().count() > 60 {
+                owned_snippet = first_line.chars().take(60).collect::<String>();
+                owned_snippet.as_str()
+            } else {
+                first_line
+            };
+            return Some(snippet.to_string());
         }
     }
 
@@ -488,7 +488,7 @@ fn relative_time(ts: OffsetDateTime) -> String {
     let secs = delta.whole_seconds().max(0) as u64;
     let dur = std::time::Duration::from_secs(secs);
     if dur.as_secs() < 60 {
-        return format!("{}s ago", dur.as_secs().max(0));
+        return format!("{}s ago", dur.as_secs());
     }
     let formatted = humantime::format_duration(dur).to_string();
     // Take just the first token (e.g. "2m" from "2m 30s").
@@ -879,9 +879,9 @@ fn cmd_thumbnail(cli_data_dir: &Option<PathBuf>, args: ThumbnailArgs) -> Result<
     let id = parse_uuid(&args.id)?;
     let store = open_store(cli_data_dir)?;
     let cd = cache_dir()?;
-    match generate_item_thumbnail(&store, &cd, id)? {
-        Some(path) => println!("{}", path.display()),
-        None => {} // not an image item — print nothing, exit 0
+    // not an image item — print nothing, exit 0
+    if let Some(path) = generate_item_thumbnail(&store, &cd, id)? {
+        println!("{}", path.display());
     }
     Ok(())
 }

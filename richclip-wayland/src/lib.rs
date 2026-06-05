@@ -54,10 +54,7 @@ impl ClipboardBackend for WlrDataControlBackend {
         }
     }
 
-    fn restore_item(
-        &mut self,
-        _item: RestorableItem,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send {
-        async { unimplemented!("restore lands in P2-M4") }
+    async fn restore_item(&mut self, _item: RestorableItem) -> anyhow::Result<()> {
+        unimplemented!("restore lands in P2-M4")
     }
 }

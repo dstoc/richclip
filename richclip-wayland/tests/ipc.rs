@@ -178,7 +178,7 @@ fn test_ipc_full_flow() {
             .env("RICHCLIP_DATA_DIR", data_dir.path())
             .env("RICHCLIP_SOCKET", &socket)
             .env_remove("WAYLAND_DISPLAY")
-            .args(&["watch", "--json", "--event", "item-added"])
+            .args(["watch", "--json", "--event", "item-added"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

@@ -137,12 +137,13 @@ impl Store {
 
         // Inline blob cleanup: if the old hash changed and nothing else
         // references the old blob, delete the file.
-        if let Some(old) = old_hash {
-            if old != hash && !db::blob_hash_has_references(&tx, &old)? {
-                tx.commit()?;
-                blob::delete_blob(&self.blob_root, &old)?;
-                return Ok(());
-            }
+        if let Some(old) = old_hash
+            && old != hash
+            && !db::blob_hash_has_references(&tx, &old)?
+        {
+            tx.commit()?;
+            blob::delete_blob(&self.blob_root, &old)?;
+            return Ok(());
         }
 
         tx.commit()?;

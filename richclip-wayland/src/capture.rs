@@ -275,17 +275,14 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        match event {
-            zwlr_data_control_offer_v1::Event::Offer { mime_type } => {
-                // Accumulate the MIME type into this offer's list.
-                if let Some(mimes) = state.offers.get_mut(&offer.id()) {
-                    mimes.push(mime_type);
-                }
-                // If the offer is not in the map the `DataOffer` event hasn't
-                // arrived yet, which should not happen per protocol ordering —
-                // but we silently ignore it to be robust.
+        if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
+            // Accumulate the MIME type into this offer's list.
+            if let Some(mimes) = state.offers.get_mut(&offer.id()) {
+                mimes.push(mime_type);
             }
-            _ => {}
+            // If the offer is not in the map the `DataOffer` event hasn't
+            // arrived yet, which should not happen per protocol ordering —
+            // but we silently ignore it to be robust.
         }
     }
 }

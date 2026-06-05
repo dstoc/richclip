@@ -30,6 +30,11 @@ use richclip::Store;
 // Shared daemon state
 // ---------------------------------------------------------------------------
 
+/// Self-capture suppression marker: the set of `(mime, blob_hash)` fingerprint
+/// pairs for the most-recently restored item, shared across daemon tasks.
+/// `None` means no restore is in flight.
+type SuppressionMarker = Arc<std::sync::Mutex<Option<HashSet<(String, String)>>>>;
+
 /// Shared state threaded through the daemon's tasks.
 #[derive(Clone)]
 pub struct DaemonState {
@@ -54,7 +59,7 @@ pub struct DaemonState {
     /// `None` means no restore is in flight (or the last captured item didn't
     /// match).  `Some(set)` holds the fingerprint of the most-recently restored
     /// item.
-    pub suppression: Arc<std::sync::Mutex<Option<HashSet<(String, String)>>>>,
+    pub suppression: SuppressionMarker,
 }
 
 impl DaemonState {
@@ -323,10 +328,10 @@ async fn handle_watch_events(
         }
 
         // Apply mime_filter.
-        if let Some(ref mime) = params.mime_filter {
-            if !event_matches_mime(&event, mime) {
-                continue;
-            }
+        if let Some(ref mime) = params.mime_filter
+            && !event_matches_mime(&event, mime)
+        {
+            continue;
         }
 
         // Serialize and send.
