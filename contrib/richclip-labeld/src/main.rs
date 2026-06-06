@@ -185,7 +185,7 @@ fn ensure_response_ok(response: Response) -> Result<()> {
     }
 }
 
-fn choose_image_mime<'a>(formats: &'a [String]) -> Option<&'a str> {
+fn choose_image_mime(formats: &[String]) -> Option<&str> {
     IMAGE_MIME_PRIORITY
         .iter()
         .find(|candidate| formats.iter().any(|mime| mime == **candidate))
