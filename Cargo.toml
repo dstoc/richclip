@@ -1,5 +1,5 @@
 [workspace]
-members = ["richclip-wayland"]
+members = ["contrib/richclip-labeld", "richclip-wayland"]
 resolver = "3"
 
 [package]

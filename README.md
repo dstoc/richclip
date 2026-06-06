@@ -92,7 +92,16 @@ richclip thumbnail <id>
 
 ### Async labelling
 
-`watch` + `update` is the enrichment loop — keep the model out of the daemon:
+Use the maintained contrib worker in [`contrib/richclip-labeld`](contrib/richclip-labeld/)
+for image labelling. It watches `item-added` image events, reads the preferred
+stored image bytes locally, sends them to an OpenAI-compatible vision endpoint,
+and writes the result back as `application/x-richclip-label`.
+
+See [`contrib/README.md`](contrib/README.md) for build/install, config, and
+service examples.
+
+`watch` + `update` is still the underlying enrichment loop if you want to build
+your own worker:
 
 ```sh
 richclip watch --json --event item-added --image |
