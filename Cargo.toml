@@ -2,10 +2,14 @@
 members = ["contrib/richclip-labeld", "richclip-wayland"]
 resolver = "3"
 
-[package]
-name = "richclip"
+[workspace.package]
 version = "0.1.1"
 edition = "2024"
+
+[package]
+name = "richclip"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "richclip"

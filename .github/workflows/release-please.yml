@@ -48,8 +48,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwayland-dev
       - name: Build
-        # --workspace builds both binaries: the richclip CLI (root crate) and
-        # the richclipd daemon (richclip-wayland crate).
+        # --workspace builds all shipped binaries: the richclip CLI (root
+        # crate), the richclipd daemon (richclip-wayland crate), and the
+        # contrib image labeller (richclip-labeld crate).
         run: cargo build --release --workspace --locked --target ${{ matrix.target }}
       - name: Package
         shell: bash
@@ -57,7 +58,7 @@ jobs:
           staging="richclip-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}"
           bindir="target/${{ matrix.target }}/release"
           mkdir "$staging"
-          cp "$bindir/richclip" "$bindir/richclipd" "$staging/"
+          cp "$bindir/richclip" "$bindir/richclipd" "$bindir/richclip-labeld" "$staging/"
           cp README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
