@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.2](https://github.com/dstoc/richclip/compare/richclip-v0.1.1...richclip-v0.1.2) (2026-06-06)
+
+
+### Features
+
+* **contrib:** add image labeller ([064e45d](https://github.com/dstoc/richclip/commit/064e45d01a0ca90222c7347934059a49b0ce028c))
+* **watch:** add image-aware filters ([7ebfedf](https://github.com/dstoc/richclip/commit/7ebfedf28f87c6b4b68f94e7a9ee5168d1993810))
+
+
+### Bug Fixes
+
+* **richclipd:** exit promptly on Ctrl-C ([427aa4a](https://github.com/dstoc/richclip/commit/427aa4a687cae02bcda026faa3432084ba29e79b))
+
 ## [0.1.1](https://github.com/dstoc/richclip/compare/richclip-v0.1.0...richclip-v0.1.1) (2026-06-05)
 
 
