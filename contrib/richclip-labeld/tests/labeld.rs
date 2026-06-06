@@ -117,14 +117,24 @@ fn handle_connection(
 ) {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).ok().filter(|n| *n > 0).is_none() {
+    if reader
+        .read_line(&mut request_line)
+        .ok()
+        .filter(|n| *n > 0)
+        .is_none()
+    {
         return;
     }
 
     let mut headers = HashMap::new();
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).ok().filter(|n| *n > 0).is_none() {
+        if reader
+            .read_line(&mut line)
+            .ok()
+            .filter(|n| *n > 0)
+            .is_none()
+        {
             return;
         }
         if line == "\r\n" {
@@ -155,11 +165,15 @@ fn handle_connection(
         body,
     });
 
-    let response = responses.lock().unwrap().pop_front().unwrap_or(MockResponse {
-        status: 500,
-        content_type: "text/plain",
-        body: b"unexpected extra request".to_vec(),
-    });
+    let response = responses
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or(MockResponse {
+            status: 500,
+            content_type: "text/plain",
+            body: b"unexpected extra request".to_vec(),
+        });
 
     let reason = match response.status {
         200 => "OK",
@@ -335,13 +349,17 @@ fn wait_for_label(data_dir: &TempDir, id: Uuid, expected: &str) {
 }
 
 fn wait_for_no_label(data_dir: &TempDir, id: Uuid) {
-    wait_until(Duration::from_secs(3), || read_label(data_dir, id).is_none())
-        .expect("label unexpectedly present");
+    wait_until(Duration::from_secs(3), || {
+        read_label(data_dir, id).is_none()
+    })
+    .expect("label unexpectedly present");
 }
 
 fn wait_for_request_count(server: &MockServer, expected: usize) {
-    wait_until(Duration::from_secs(5), || server.request_count() == expected)
-        .expect("mock server did not receive expected request count");
+    wait_until(Duration::from_secs(5), || {
+        server.request_count() == expected
+    })
+    .expect("mock server did not receive expected request count");
 }
 
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> Option<()> {
@@ -363,7 +381,8 @@ fn list_item(data_dir: &TempDir, socket: &Path, id: Uuid) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     let items: Vec<Value> = serde_json::from_slice(&output.stdout).expect("list json");
-    items.into_iter()
+    items
+        .into_iter()
         .find(|item| item["id"].as_str() == Some(&id.to_string()))
         .expect("item missing from list")
 }
@@ -435,15 +454,25 @@ fn labels_images_and_skips_existing_empty_and_failed_items() {
     let failing_id = add_image_item(&data_dir, &socket, b"failing label bytes");
     wait_for_request_count(&server, 3);
     wait_for_no_label(&data_dir, failing_id);
-    assert!(labeld.0.try_wait().unwrap().is_none(), "labeld exited after per-item failure");
+    assert!(
+        labeld.0.try_wait().unwrap().is_none(),
+        "labeld exited after per-item failure"
+    );
 
     let post_failure_id = add_image_item(&data_dir, &socket, b"post failure bytes");
     wait_for_request_count(&server, 4);
     wait_for_label(&data_dir, post_failure_id, "forest path");
-    assert!(labeld.0.try_wait().unwrap().is_none(), "labeld exited before subsequent item");
+    assert!(
+        labeld.0.try_wait().unwrap().is_none(),
+        "labeld exited before subsequent item"
+    );
 
     let requests = server.recorded_requests();
-    assert_eq!(requests.len(), 4, "prelabelled item should have been skipped");
+    assert_eq!(
+        requests.len(),
+        4,
+        "prelabelled item should have been skipped"
+    );
     assert_eq!(requests[0].path, "/v1/chat/completions");
     assert_eq!(
         requests[0].authorization.as_deref(),
@@ -453,10 +482,7 @@ fn labels_images_and_skips_existing_empty_and_failed_items() {
     let first_body: Value = serde_json::from_slice(&requests[0].body).expect("request json");
     assert_eq!(first_body["model"].as_str(), Some("vision-test-model"));
     assert_eq!(first_body["max_completion_tokens"].as_i64(), Some(12));
-    assert_eq!(
-        first_body["messages"][0]["role"].as_str(),
-        Some("system")
-    );
+    assert_eq!(first_body["messages"][0]["role"].as_str(), Some("system"));
     assert_eq!(
         first_body["messages"][1]["content"][0]["type"].as_str(),
         Some("text")
@@ -472,7 +498,11 @@ fn labels_images_and_skips_existing_empty_and_failed_items() {
         image_url.starts_with("data:image/png;base64,"),
         "expected data URL image part, got {image_url}"
     );
-    assert_eq!(server.pending_responses(), 0, "unused mock responses remain");
+    assert_eq!(
+        server.pending_responses(),
+        0,
+        "unused mock responses remain"
+    );
 }
 
 #[test]
@@ -489,13 +519,7 @@ fn overwrite_replaces_existing_labels() {
         body: br#"{"choices":[{"message":{"content":"new label"}}]}"#.to_vec(),
     }]);
     let config_path = write_config(&fixture_dir, server.base_url());
-    let _labeld = start_labeld(
-        &data_dir,
-        &socket,
-        &config_path,
-        true,
-        "overwrite-secret",
-    );
+    let _labeld = start_labeld(&data_dir, &socket, &config_path, true, "overwrite-secret");
 
     let id = add_image_with_existing_label(
         &data_dir,
