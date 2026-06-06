@@ -300,8 +300,8 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
 /// Subscribe to the broadcast channel and stream matching events to the client.
 ///
 /// Runs until the client disconnects (write error) or the broadcast sender is
-/// dropped.  Applies `event_filter` (match on the event tag) and `mime_filter`
-/// (pass if the event carries the mime).
+/// dropped.  Applies `event_filter` (match on the event tag) and
+/// `mime_filters` (pass if the event carries any requested mime).
 async fn handle_watch_events(
     params: WatchEventsParams,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
@@ -327,9 +327,12 @@ async fn handle_watch_events(
             }
         }
 
-        // Apply mime_filter.
-        if let Some(ref mime) = params.mime_filter
-            && !event_matches_mime(&event, mime)
+        // Apply mime_filters with OR semantics across exact MIME matches.
+        if !params.mime_filters.is_empty()
+            && !params
+                .mime_filters
+                .iter()
+                .any(|mime| event_matches_mime(&event, mime))
         {
             continue;
         }
@@ -359,7 +362,7 @@ fn event_tag(ev: &WatchEvent) -> &'static str {
     }
 }
 
-/// Returns true if the event passes a MIME filter.
+/// Returns true if the event passes a single exact MIME filter.
 ///
 /// - `ItemAdded`: pass if the `formats` list contains `mime`.
 /// - `ItemUpdated`: pass if the `changed` list contains `mime`.

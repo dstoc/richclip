@@ -302,6 +302,7 @@ richclip watch
 richclip watch --json
 richclip watch --event item-added
 richclip watch --event item-updated
+richclip watch --image
 richclip watch --mime image/png
 ```
 
@@ -319,10 +320,12 @@ Example event:
 A labeller could do:
 
 ```sh
-richclip watch --json --event item-added --mime image/png |
+richclip watch --json --event item-added --image |
 while read -r event; do
   id="$(jq -r .id <<<"$event")"
-  richclip decode "$id" image/png > /tmp/clip.png
+  mime="$(jq -r '.formats[] | select(startswith("image/"))' <<<"$event" | head -n1)"
+  [ -n "$mime" ] || continue
+  richclip decode "$id" "$mime" > /tmp/clip.png
   label="$(label-image /tmp/clip.png)"
   printf '%s' "$label" | richclip update "$id" --set-mime application/x-richclip-label=-
 done

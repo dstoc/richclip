@@ -62,8 +62,8 @@ pub struct UpdateItemParams {
 pub struct WatchEventsParams {
     /// If set, only surface events of this type (e.g. "item-added").
     pub event_filter: Option<String>,
-    /// If set, only surface events for items that have this MIME type.
-    pub mime_filter: Option<String>,
+    /// If set, only surface events for items that have any of these MIME types.
+    pub mime_filters: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

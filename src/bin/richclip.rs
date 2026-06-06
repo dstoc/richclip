@@ -13,7 +13,7 @@
 //! Reads (`list`, `formats`, `inspect`, `decode`) always go direct to the DB
 //! (SQLite WAL mode allows concurrent readers).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use richclip::ipc::{
     AddItemParams, Request, Response, UpdateItemParams, WatchEventsParams, client as ipc_client,
 };
@@ -180,9 +180,13 @@ struct WatchArgs {
     #[arg(long, value_name = "EVENT")]
     event: Option<String>,
 
-    /// Only show events for items that have this MIME type.
-    #[arg(long, value_name = "MIME")]
-    mime: Option<String>,
+    /// Only show events for items that have any of these MIME types.
+    #[arg(long, value_name = "MIME", action = ArgAction::Append)]
+    mime: Vec<String>,
+
+    /// Shorthand for the supported image MIME types.
+    #[arg(long, action = ArgAction::SetTrue)]
+    image: bool,
 }
 
 // --- restore ---
@@ -824,9 +828,16 @@ fn cmd_watch(args: WatchArgs) -> Result<(), AppError> {
         AppError::Usage("richclipd is not running; start the daemon first".into())
     })?;
 
+    const IMAGE_MIMES: [&str; 4] = ["image/png", "image/webp", "image/jpeg", "image/bmp"];
+    let mut mime_filters = Vec::new();
+    if args.image {
+        mime_filters.extend(IMAGE_MIMES.into_iter().map(str::to_string));
+    }
+    mime_filters.extend(args.mime);
+
     let req = Request::WatchEvents(WatchEventsParams {
         event_filter: args.event.clone(),
-        mime_filter: args.mime.clone(),
+        mime_filters,
     });
 
     let iter = ipc_client::watch_events(stream, &req)

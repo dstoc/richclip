@@ -81,7 +81,7 @@ richclip delete <id> --mime text/html
 richclip delete --older-than 30d
 
 # Live events (needs richclipd) — the async-labeller hook
-richclip watch --json --event item-added --mime image/png
+richclip watch --json --event item-added --image
 
 # Become the clipboard owner again (needs richclipd)
 richclip restore <id>
@@ -95,10 +95,12 @@ richclip thumbnail <id>
 `watch` + `update` is the enrichment loop — keep the model out of the daemon:
 
 ```sh
-richclip watch --json --event item-added --mime image/png |
+richclip watch --json --event item-added --image |
 while read -r ev; do
   id=$(jq -r .id <<<"$ev")
-  richclip decode "$id" image/png > /tmp/clip.png
+  mime=$(jq -r '.formats[] | select(startswith("image/"))' <<<"$ev" | head -n1)
+  [ -n "$mime" ] || continue
+  richclip decode "$id" "$mime" > /tmp/clip.png
   label-image /tmp/clip.png | richclip update "$id" --set-mime application/x-richclip-label=-
 done
 ```
