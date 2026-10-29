@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/dstoc/richclip/compare/richclip-v0.1.2...richclip-v0.1.3) (2026-10-29)
+
+
+### Features
+
+* filter token-like clipboard text ([#4](https://github.com/dstoc/richclip/issues/4)) ([b20f0f1](https://github.com/dstoc/richclip/commit/b20f0f1549a161d9bf458ebd0e6c4b58fcfe4d83))
+
 ## [0.1.2](https://github.com/dstoc/richclip/compare/richclip-v0.1.1...richclip-v0.1.2) (2026-06-06)
 
 
