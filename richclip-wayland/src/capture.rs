@@ -308,41 +308,6 @@ fn retain_format(formats: &mut Vec<CapturedFormat>, format: CapturedFormat) -> b
     true
 }
 
-#[cfg(test)]
-mod content_tests {
-    use super::*;
-
-    #[test]
-    fn later_sensitive_format_discards_group_and_clean_group_reaches_sink() {
-        use std::sync::{Arc, Mutex};
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let output = received.clone();
-        let mut sink = CaptureSink::new(move |item| output.lock().unwrap().push(item));
-        let make = |mime: &str, bytes: Vec<u8>| CapturedFormat {
-            mime: mime.into(),
-            bytes,
-        };
-        let mut formats = Vec::new();
-        assert!(retain_format(
-            &mut formats,
-            make("image/png", vec![b'A'; 30])
-        ));
-        assert!(!retain_format(
-            &mut formats,
-            make("text/plain", vec![b'A'; 30])
-        ));
-        assert!(formats.is_empty());
-        assert!(received.lock().unwrap().is_empty());
-        assert!(retain_format(&mut formats, make("image/png", vec![1])));
-        assert!(retain_format(
-            &mut formats,
-            make("text/plain", b"ordinary text".to_vec())
-        ));
-        sink.push(CapturedItem { formats });
-        assert_eq!(received.lock().unwrap()[0].formats.len(), 2);
-    }
-}
-
 // ─── Receive helper ───────────────────────────────────────────────────────────
 
 /// Request the compositor to send `mime` data for `offer` over a Unix socket
@@ -466,5 +431,40 @@ pub fn run_capture(config: CaptureConfig, sink: CaptureSink) -> anyhow::Result<(
     // the connection, which propagates up as our return value.
     loop {
         event_queue.blocking_dispatch(&mut state)?;
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    #[test]
+    fn later_sensitive_format_discards_group_and_clean_group_reaches_sink() {
+        use std::sync::{Arc, Mutex};
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        let mut sink = CaptureSink::new(move |item| output.lock().unwrap().push(item));
+        let make = |mime: &str, bytes: Vec<u8>| CapturedFormat {
+            mime: mime.into(),
+            bytes,
+        };
+        let mut formats = Vec::new();
+        assert!(retain_format(
+            &mut formats,
+            make("image/png", vec![b'A'; 30])
+        ));
+        assert!(!retain_format(
+            &mut formats,
+            make("text/plain", vec![b'A'; 30])
+        ));
+        assert!(formats.is_empty());
+        assert!(received.lock().unwrap().is_empty());
+        assert!(retain_format(&mut formats, make("image/png", vec![1])));
+        assert!(retain_format(
+            &mut formats,
+            make("text/plain", b"ordinary text".to_vec())
+        ));
+        sink.push(CapturedItem { formats });
+        assert_eq!(received.lock().unwrap()[0].formats.len(), 2);
     }
 }

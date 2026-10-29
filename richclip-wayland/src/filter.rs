@@ -217,9 +217,9 @@ mod tests {
 
     #[test]
     fn token_boundaries_and_characters() {
-        for c in [b'A', b'z', b'0', b'_', b'-'] {
-            assert!(!contains_sensitive_text("text/plain", &vec![c; 29]));
-            assert!(contains_sensitive_text("text/plain", &vec![c; 30]));
+        for c in *b"Az0_-" {
+            assert!(!contains_sensitive_text("text/plain", &[c; 29]));
+            assert!(contains_sensitive_text("text/plain", &[c; 30]));
         }
         assert!(contains_sensitive_text(
             "text/plain",
@@ -233,8 +233,8 @@ mod tests {
             "application/json",
             &[vec![0xff], vec![b'A'; 30]].concat()
         ));
-        assert!(contains_sensitive_text("application/rtf", &vec![b'A'; 30]));
-        assert!(!contains_sensitive_text("image/png", &vec![b'A'; 30]));
+        assert!(contains_sensitive_text("application/rtf", &[b'A'; 30]));
+        assert!(!contains_sensitive_text("image/png", &[b'A'; 30]));
     }
 
     #[test]
