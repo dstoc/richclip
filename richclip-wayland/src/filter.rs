@@ -90,6 +90,52 @@ pub fn is_sensitive(offered_mimes: &[String]) -> bool {
     false
 }
 
+/// Check captured textual bytes for a long token-like run outside URL spans.
+/// URL recognition deliberately follows a conservative ASCII-only convention.
+pub fn contains_sensitive_text(mime: &str, bytes: &[u8]) -> bool {
+    if !(mime.starts_with("text/") || matches!(mime, "application/json" | "application/rtf")) {
+        return false;
+    }
+    fn scheme_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+    }
+    fn url_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b"-._~:/?#@!$&*+=%;".contains(&b)
+    }
+    let mut i = 0;
+    let mut run = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic()
+            && (i == 0 || !(scheme_byte(bytes[i - 1]) || bytes[i - 1] == b'_'))
+        {
+            let mut end = i + 1;
+            while end < bytes.len() && scheme_byte(bytes[end]) {
+                end += 1;
+            }
+            if bytes.get(end..end + 3) == Some(b"://")
+                && bytes.get(end + 3).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                i = end + 3;
+                while i < bytes.len() && url_byte(bytes[i]) {
+                    i += 1;
+                }
+                run = 0;
+                continue;
+            }
+        }
+        if bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-') {
+            run += 1;
+            if run >= 30 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// An accepted MIME type from a clipboard offer.
 ///
 /// Capture needs two forms of the type:
@@ -167,6 +213,58 @@ mod tests {
 
     fn cfg() -> CaptureConfig {
         CaptureConfig::default()
+    }
+
+    #[test]
+    fn token_boundaries_and_characters() {
+        for c in *b"Az0_-" {
+            assert!(!contains_sensitive_text("text/plain", &[c; 29]));
+            assert!(contains_sensitive_text("text/plain", &[c; 30]));
+        }
+        assert!(contains_sensitive_text(
+            "text/plain",
+            b"let abcdefghijklmnopqrstuvwxyz_1234 = 1;"
+        ));
+        assert!(!contains_sensitive_text(
+            "text/plain",
+            b"AAAAAAAAAAAAAAA.AAAAAAAAAAAAAAA"
+        ));
+        assert!(contains_sensitive_text(
+            "application/json",
+            &[vec![0xff], vec![b'A'; 30]].concat()
+        ));
+        assert!(contains_sensitive_text("application/rtf", &[b'A'; 30]));
+        assert!(!contains_sensitive_text("image/png", &[b'A'; 30]));
+    }
+
+    #[test]
+    fn url_boundaries_and_mixed_content() {
+        let token = "A".repeat(30);
+        for text in [
+            format!("https://example.test/{token}"),
+            format!("\"https://example.test/{token}\""),
+            format!("[https://example.test/{token}]"),
+            format!("https://a.test/{token} https://b.test/{token}"),
+        ] {
+            assert!(
+                !contains_sensitive_text("text/plain", text.as_bytes()),
+                "{text}"
+            );
+        }
+        for text in [
+            format!("[link](https://example.test/){token}"),
+            format!("https://example.test/a,{token}"),
+            format!("https://example.test/{token} {token}"),
+            format!("mailto:{token}"),
+            format!("https://example.test/a({token}"),
+            format!("_https://example.test/{token}"),
+            format!("https:///{token}"),
+        ] {
+            assert!(
+                contains_sensitive_text("text/plain", text.as_bytes()),
+                "{text}"
+            );
+        }
     }
 
     // ── mime_base_type ────────────────────────────────────────────────────────

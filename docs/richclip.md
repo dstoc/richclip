@@ -400,10 +400,30 @@ Two correctness notes up front:
   must be read while the offer is still alive; read the accepted types
   concurrently and don't block, or the offer closes and data is lost.
 
-**Sensitive content.** Password managers and similar tools mark secret
+### Sensitive content
+
+Password managers and similar tools mark secret
 selections (e.g. a `x-kde-passwordManagerHint` value of `secret`, or
 `org.freedesktop.SecretService`-style hints). When such a hint is present, skip
 the selection entirely — store nothing. This is checked before the allowlist.
+
+After reading each accepted `text/*`, `application/json`, or `application/rtf`
+representation, capture checks its bytes for 30 or more consecutive ASCII
+letters, digits, underscores, or hyphens outside a recognized URL. A match
+discards every representation of the item before it reaches history. The
+active clipboard is unchanged. Source code and identifiers are checked too,
+so ordinary content can be rejected. This is a heuristic, not comprehensive
+secret detection; it does not inspect images, unreadable or unaccepted formats,
+manual additions, or existing history.
+
+The URL exception recognizes an ASCII scheme followed by `://` and an ASCII
+letter or digit. URL spans end at whitespace, non-ASCII bytes, quotes, brackets,
+parentheses, commas, backslashes, and other characters outside
+`-._~:/?#@!$&*+=%;` and ASCII letters and digits. URLs without `://`, URLs with
+non-ASCII components, and URLs beginning with punctuation after `://` may not
+be fully recognized. A long component after a boundary may be rejected, while
+text joined to a URL by an allowed character may be exempted. Only the URL span
+is exempt; separate text is still checked.
 
 Filtering matters. Some apps may advertise large, redundant, or awkward types. Start with a default allowlist:
 

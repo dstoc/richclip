@@ -28,6 +28,16 @@ rows, one per MIME type, each pointing at a content-addressed blob. Generated
 data (labels, OCR, search text) is just another format under the
 `application/x-richclip-*` namespace — stored but never advertised on restore.
 
+### Sensitive clipboard content
+
+Richclip skips offers marked sensitive by MIME hints. It also discards a whole
+captured item if a captured text, JSON, or RTF representation contains 30 or
+more consecutive ASCII letters, digits, underscores, or hyphens outside a
+recognized URL. The active clipboard is left alone. This heuristic can reject
+ordinary identifiers and is not comprehensive secret detection. It does not
+inspect images, unreadable or unaccepted formats, manual additions, or existing
+history. URL recognition has limits; see [Sensitive content](docs/richclip.md#sensitive-content).
+
 ### Crates
 
 ```text
