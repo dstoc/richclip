@@ -211,11 +211,16 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                     match drain_format(&state.conn, &offer, &am.offered, &state.config, total_bytes)
                     {
                         Ok(Some(bytes)) => {
-                            total_bytes = total_bytes.saturating_add(bytes.len());
-                            formats.push(CapturedFormat {
+                            let format = CapturedFormat {
                                 mime: am.store_as.clone(),
                                 bytes,
-                            });
+                            };
+                            if !retain_format(&mut formats, format) {
+                                state.offers.remove(&offer.id());
+                                return;
+                            }
+                            total_bytes =
+                                total_bytes.saturating_add(formats.last().unwrap().bytes.len());
                         }
                         Ok(None) => {
                             // Skipped due to size cap — also stop accepting more.
@@ -290,6 +295,51 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
             // arrived yet, which should not happen per protocol ordering —
             // but we silently ignore it to be robust.
         }
+    }
+}
+
+// A sensitive representation invalidates the entire grouped item.
+fn retain_format(formats: &mut Vec<CapturedFormat>, format: CapturedFormat) -> bool {
+    if filter::contains_sensitive_text(&format.mime, &format.bytes) {
+        formats.clear();
+        return false;
+    }
+    formats.push(format);
+    true
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    #[test]
+    fn later_sensitive_format_discards_group_and_clean_group_reaches_sink() {
+        use std::sync::{Arc, Mutex};
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        let mut sink = CaptureSink::new(move |item| output.lock().unwrap().push(item));
+        let make = |mime: &str, bytes: Vec<u8>| CapturedFormat {
+            mime: mime.into(),
+            bytes,
+        };
+        let mut formats = Vec::new();
+        assert!(retain_format(
+            &mut formats,
+            make("image/png", vec![b'A'; 30])
+        ));
+        assert!(!retain_format(
+            &mut formats,
+            make("text/plain", vec![b'A'; 30])
+        ));
+        assert!(formats.is_empty());
+        assert!(received.lock().unwrap().is_empty());
+        assert!(retain_format(&mut formats, make("image/png", vec![1])));
+        assert!(retain_format(
+            &mut formats,
+            make("text/plain", b"ordinary text".to_vec())
+        ));
+        sink.push(CapturedItem { formats });
+        assert_eq!(received.lock().unwrap()[0].formats.len(), 2);
     }
 }
 
