@@ -257,11 +257,11 @@ fn test_update_remove_mime() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: blob dedup — two items with identical bytes share blob_hash
+// Test 7: distinct item groups with identical bytes share one blob
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_blob_dedup() {
+fn test_blob_dedup_across_distinct_items() {
     let dir = TempDir::new().unwrap();
 
     let shared = "identical content for dedup test";
@@ -277,7 +277,7 @@ fn test_blob_dedup() {
     let id1 = String::from_utf8(id1_out).unwrap().trim().to_string();
 
     let id2_out = cmd(&dir)
-        .args(["add", "--set-mime", "text/plain=-"])
+        .args(["add", "--set-mime", "text/html=-"])
         .write_stdin(shared)
         .assert()
         .success()
@@ -285,6 +285,21 @@ fn test_blob_dedup() {
         .stdout
         .clone();
     let id2 = String::from_utf8(id2_out).unwrap().trim().to_string();
+    assert_ne!(id1, id2, "different MIME groups must remain distinct items");
+
+    let list_out = cmd(&dir)
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&list_out).unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "distinct MIME groups must both remain in history"
+    );
 
     // inspect both items and compare blob_hash
     let inspect1_out = cmd(&dir)

@@ -28,6 +28,12 @@ rows, one per MIME type, each pointing at a content-addressed blob. Generated
 data (labels, OCR, search text) is just another format under the
 `application/x-richclip-*` namespace — stored but never advertised on restore.
 
+When an add has the same complete set of stored clipboard MIME types and bytes
+as older items, richclip keeps the new ID and removes every matching older
+item. It ignores internal `application/x-richclip-*` enrichment when matching
+and carries forward missing enrichment from the newest match. Different MIME
+sets or bytes remain separate history items.
+
 ### Sensitive clipboard content
 
 Richclip skips offers marked sensitive by MIME hints. It also discards a whole

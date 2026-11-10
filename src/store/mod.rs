@@ -1,9 +1,9 @@
 //! The [`Store`] is the primary public API of the richclip library.
 //!
 //! It combines a SQLite index (`db.rs`) with a content-addressed blob
-//! directory (`blob.rs`). All mutations are performed inside a single
-//! transaction. Blobs that lose all `formats` references are deleted inline
-//! (no deferred GC).
+//! directory (`blob.rs`). Database changes use one transaction per mutation.
+//! Blob writes and reference-checked cleanup run under SQLite's writer lock so
+//! independent store processes cannot race file creation against deletion.
 
 mod blob;
 mod db;
@@ -14,10 +14,24 @@ pub use blob::blob_hash;
 use crate::error::Result;
 use crate::model::{Format, ItemWithFormats};
 use crate::paths::default_data_dir;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// The committed result of adding an item, including history rows replaced by
+/// this add and the final MIME list visible to consumers.
+#[derive(Debug, Clone)]
+pub struct AddItemResult {
+    pub id: Uuid,
+    pub created_at: OffsetDateTime,
+    pub formats: Vec<String>,
+    pub removed_ids: Vec<Uuid>,
+    /// A post-commit blob cleanup failure does not undo the add. Callers that
+    /// can report warnings should surface this message.
+    pub blob_cleanup_error: Option<String>,
+}
 
 /// The richclip storage layer: SQLite item/format index + blob directory.
 pub struct Store {
@@ -67,39 +81,121 @@ impl Store {
     ///
     /// Returns the new item's [`Uuid`] (v7).
     pub fn add_item(&mut self, formats: &[(String, Vec<u8>)]) -> Result<Uuid> {
+        self.add_item_with_result(formats).map(|result| result.id)
+    }
+
+    /// Add an item and return the final stored formats and older items removed
+    /// because they had identical clipboard content.
+    ///
+    /// This keeps the established [`Store::add_item`] return type available to
+    /// library callers while letting event-producing callers preserve delete
+    /// side effects and publish the actual stored MIME list.
+    pub fn add_item_with_result(&mut self, formats: &[(String, Vec<u8>)]) -> Result<AddItemResult> {
+        // The primary key makes the last supplied value for each MIME the
+        // effective persisted value. Keep that same view for comparison and
+        // insertion.
+        let mut effective = BTreeMap::<String, Vec<u8>>::new();
+        for (mime, bytes) in formats {
+            effective.insert(mime.clone(), bytes.clone());
+        }
+
+        let clipboard_content: BTreeMap<String, String> = effective
+            .iter()
+            .filter(|(mime, _)| !is_internal_mime(mime))
+            .map(|(mime, bytes)| (mime.clone(), blob::hash_bytes(bytes)))
+            .collect();
+
+        // IMMEDIATE reserves the SQLite writer before checking history or
+        // touching blob files. Independent Store instances therefore see
+        // earlier commits and cannot race blob cleanup against a new write.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let matching = if clipboard_content.is_empty() {
+            Vec::new()
+        } else {
+            db::list_items(&tx, None, None)?
+                .into_iter()
+                .filter(|item| {
+                    let existing: BTreeMap<String, String> = item
+                        .formats
+                        .iter()
+                        .filter(|format| !is_internal_mime(&format.mime))
+                        .map(|format| (format.mime.clone(), format.blob_hash.clone()))
+                        .collect();
+                    !existing.is_empty() && existing == clipboard_content
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let inherited: Vec<Format> = matching
+            .first()
+            .map(|item| {
+                item.formats
+                    .iter()
+                    .filter(|format| {
+                        is_internal_mime(&format.mime) && !effective.contains_key(&format.mime)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let now = OffsetDateTime::now_utc();
         let id = Uuid::now_v7();
-
         let item = crate::model::Item {
             id,
             created_at: now,
             updated_at: now,
         };
 
-        // Write blobs outside the transaction (idempotent; worst case leaves
-        // an orphan blob that will be deduplicated on the next identical
-        // write). Then do all DB work in one transaction.
-        let mut hashes = Vec::with_capacity(formats.len());
-        for (_, bytes) in formats {
-            let hash = blob::write_blob(&self.blob_root, bytes)?;
-            hashes.push(hash);
-        }
-
-        let tx = self.conn.transaction()?;
+        let mut orphan_candidates = BTreeSet::new();
         db::insert_item(&tx, &item)?;
-        for ((mime, bytes), hash) in formats.iter().zip(&hashes) {
-            let fmt = Format {
-                item_id: id,
-                mime: mime.clone(),
-                blob_hash: hash.clone(),
-                size: bytes.len() as u64,
-                captured_at: now,
-            };
-            db::upsert_format(&tx, &fmt)?;
+        for (mime, bytes) in &effective {
+            let hash = blob::write_blob(&self.blob_root, bytes)?;
+            db::upsert_format(
+                &tx,
+                &Format {
+                    item_id: id,
+                    mime: mime.clone(),
+                    blob_hash: hash,
+                    size: bytes.len() as u64,
+                    captured_at: now,
+                },
+            )?;
         }
-        tx.commit()?;
+        for mut format in inherited {
+            format.item_id = id;
+            db::upsert_format(&tx, &format)?;
+        }
 
-        Ok(id)
+        let removed_ids: Vec<Uuid> = matching.iter().map(|item| item.item.id).collect();
+        for old_id in &removed_ids {
+            orphan_candidates.extend(db::delete_formats_for_item(&tx, *old_id)?);
+            db::delete_item_row(&tx, *old_id)?;
+        }
+
+        let mut final_formats = db::get_formats(&tx, id)?;
+        final_formats.sort_by(|a, b| a.mime.cmp(&b.mime));
+        let mime_list = final_formats
+            .into_iter()
+            .map(|format| format.mime)
+            .collect();
+
+        tx.commit()?;
+        let blob_cleanup_error = self
+            .cleanup_unreferenced_blobs(orphan_candidates)
+            .err()
+            .map(|error| error.to_string());
+
+        Ok(AddItemResult {
+            id,
+            created_at: now,
+            formats: mime_list,
+            removed_ids,
+            blob_cleanup_error,
+        })
     }
 
     /// Add or replace one format on an existing item.
@@ -107,9 +203,10 @@ impl Store {
     /// Bumps `updated_at`. Returns `Err(NotFound)` if the item does not exist.
     pub fn set_format(&mut self, id: Uuid, mime: &str, bytes: &[u8]) -> Result<()> {
         let now = OffsetDateTime::now_utc();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let hash = blob::write_blob(&self.blob_root, bytes)?;
-
-        let tx = self.conn.transaction()?;
 
         // Capture any old hash before we overwrite the row.
         let old_hash: Option<String> = {
@@ -142,7 +239,7 @@ impl Store {
             && !db::blob_hash_has_references(&tx, &old)?
         {
             tx.commit()?;
-            blob::delete_blob(&self.blob_root, &old)?;
+            self.cleanup_unreferenced_blobs([old])?;
             return Ok(());
         }
 
@@ -156,17 +253,15 @@ impl Store {
     pub fn remove_format(&mut self, id: Uuid, mime: &str) -> Result<()> {
         let now = OffsetDateTime::now_utc();
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Verify item exists first so we get a clear NotFound.
         db::require_item(&tx, id)?;
         let old_hash = db::delete_format_row(&tx, id, mime)?;
         db::bump_updated_at(&tx, id, now)?;
-        let still_referenced = db::blob_hash_has_references(&tx, &old_hash)?;
         tx.commit()?;
-
-        if !still_referenced {
-            blob::delete_blob(&self.blob_root, &old_hash)?;
-        }
+        self.cleanup_unreferenced_blobs([old_hash])?;
         Ok(())
     }
 
@@ -174,24 +269,14 @@ impl Store {
     ///
     /// Returns `Err(NotFound)` if the item does not exist.
     pub fn delete_item(&mut self, id: Uuid) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         db::require_item(&tx, id)?;
         let hashes = db::delete_formats_for_item(&tx, id)?;
         db::delete_item_row(&tx, id)?;
-
-        // Determine which hashes are now unreferenced.
-        let mut orphans = Vec::new();
-        for h in &hashes {
-            if !db::blob_hash_has_references(&tx, h)? {
-                orphans.push(h.clone());
-            }
-        }
         tx.commit()?;
-
-        for h in orphans {
-            blob::delete_blob(&self.blob_root, &h)?;
-        }
-        Ok(())
+        self.cleanup_unreferenced_blobs(hashes)
     }
 
     /// Delete all items whose `created_at` is before `cutoff`. Inline-cleans
@@ -199,22 +284,13 @@ impl Store {
     pub fn delete_older_than(&mut self, cutoff: OffsetDateTime) -> Result<u64> {
         let cutoff_ms = db::to_epoch_ms(cutoff);
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (ids, hashes) = db::delete_items_older_than(&tx, cutoff_ms)?;
         let count = ids.len() as u64;
-
-        // Determine orphaned blobs now that the rows are gone.
-        let mut orphans = Vec::new();
-        for h in &hashes {
-            if !db::blob_hash_has_references(&tx, h)? {
-                orphans.push(h.clone());
-            }
-        }
         tx.commit()?;
-
-        for h in orphans {
-            blob::delete_blob(&self.blob_root, &h)?;
-        }
+        self.cleanup_unreferenced_blobs(hashes)?;
         Ok(count)
     }
 
@@ -254,6 +330,35 @@ impl Store {
         let fmt = db::get_format(&self.conn, id, mime)?;
         blob::read_blob(&self.blob_root, &fmt.blob_hash)
     }
+
+    /// Delete blobs that remain unreferenced while holding SQLite's writer
+    /// lock. All blob creation also happens under this lock, so another
+    /// process cannot add a reference between the check and unlink.
+    fn cleanup_unreferenced_blobs(
+        &mut self,
+        hashes: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        let hashes: BTreeSet<String> = hashes.into_iter().collect();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let blob_root = self.blob_root.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for hash in hashes {
+            if !db::blob_hash_has_references(&tx, &hash)? {
+                blob::delete_blob(&blob_root, &hash)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn is_internal_mime(mime: &str) -> bool {
+    mime.starts_with("application/x-richclip-")
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +429,339 @@ mod tests {
 
         // Ids are time-ordered UUIDv7.
         assert_eq!(iwf.item.created_at, iwf.item.updated_at);
+    }
+
+    #[test]
+    fn adding_identical_content_keeps_the_new_id() {
+        let (mut store, _dir) = temp_store();
+        let first = store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+        let second = store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+
+        assert_ne!(first, second);
+        let items = store.list_items(None, None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item.id, second);
+    }
+
+    #[test]
+    fn adding_a_b_a_keeps_newest_a_then_b() {
+        let (mut store, _dir) = temp_store();
+        let _first_a = store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+        let b = store
+            .add_item(&[("text/plain".into(), b"B".to_vec())])
+            .unwrap();
+        let newest_a = store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+
+        let items = store.list_items(None, None).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item.id, newest_a);
+        assert_eq!(items[1].item.id, b);
+    }
+
+    #[test]
+    fn matching_uses_unordered_complete_mime_and_byte_sets() {
+        let (mut store, _dir) = temp_store();
+        let first = store
+            .add_item(&[
+                ("text/plain".into(), b"plain".to_vec()),
+                ("text/html".into(), b"<b>plain</b>".to_vec()),
+            ])
+            .unwrap();
+        let reordered = store
+            .add_item(&[
+                ("text/html".into(), b"<b>plain</b>".to_vec()),
+                ("text/plain".into(), b"plain".to_vec()),
+            ])
+            .unwrap();
+        assert!(
+            !store
+                .list_items(None, None)
+                .unwrap()
+                .iter()
+                .any(|i| i.item.id == first)
+        );
+        assert!(store.get_item(reordered).is_ok());
+
+        store
+            .add_item(&[("text/plain".into(), b"plain".to_vec())])
+            .unwrap();
+        store
+            .add_item(&[
+                ("text/plain".into(), b"plain".to_vec()),
+                ("text/html".into(), b"<i>plain</i>".to_vec()),
+            ])
+            .unwrap();
+        store
+            .add_item(&[("text/uri-list".into(), b"plain".to_vec())])
+            .unwrap();
+
+        assert_eq!(store.list_items(None, None).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn repeated_mime_input_uses_last_value_for_matching_and_storage() {
+        let (mut store, _dir) = temp_store();
+        let first = store
+            .add_item(&[
+                ("text/plain".into(), b"ignored first value".to_vec()),
+                ("text/plain".into(), b"effective last value".to_vec()),
+            ])
+            .unwrap();
+        let replacement = store
+            .add_item(&[("text/plain".into(), b"effective last value".to_vec())])
+            .unwrap();
+
+        assert_ne!(first, replacement);
+        assert_eq!(store.list_items(None, None).unwrap().len(), 1);
+        assert_eq!(store.formats(replacement).unwrap().len(), 1);
+        assert_eq!(
+            store.decode(replacement, "text/plain").unwrap(),
+            b"effective last value"
+        );
+    }
+
+    #[test]
+    fn enrichment_is_inherited_from_newest_legacy_match_and_reported() {
+        let (mut store, _dir) = temp_store();
+        let older_a = store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+        let b = store
+            .add_item(&[("text/plain".into(), b"B".to_vec())])
+            .unwrap();
+        let newer_legacy_a = store
+            .add_item(&[
+                ("text/plain".into(), b"C".to_vec()),
+                (
+                    "application/x-richclip-label".into(),
+                    b"newest label".to_vec(),
+                ),
+                ("application/x-richclip-ocr".into(), b"newest OCR".to_vec()),
+            ])
+            .unwrap();
+        store
+            .set_format(newer_legacy_a, "text/plain", b"A")
+            .unwrap();
+        store
+            .set_format(older_a, "application/x-richclip-label", b"older label")
+            .unwrap();
+
+        let added = store
+            .add_item_with_result(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+
+        assert_eq!(added.removed_ids, vec![newer_legacy_a, older_a]);
+        assert!(matches!(
+            store.set_format(
+                newer_legacy_a,
+                "application/x-richclip-label",
+                b"late label"
+            ),
+            Err(Error::NotFound)
+        ));
+        assert!(
+            added
+                .formats
+                .contains(&"application/x-richclip-label".into())
+        );
+        assert!(added.formats.contains(&"application/x-richclip-ocr".into()));
+        assert_eq!(
+            store
+                .decode(added.id, "application/x-richclip-label")
+                .unwrap(),
+            b"newest label"
+        );
+        assert_eq!(
+            store
+                .decode(added.id, "application/x-richclip-ocr")
+                .unwrap(),
+            b"newest OCR"
+        );
+        let items = store.list_items(None, None).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item.id, added.id);
+        assert_eq!(items[1].item.id, b);
+    }
+
+    #[test]
+    fn incoming_enrichment_wins_and_empty_content_items_do_not_collapse() {
+        let (mut store, _dir) = temp_store();
+        let old = store
+            .add_item(&[
+                ("text/plain".into(), b"A".to_vec()),
+                (
+                    "application/x-richclip-label".into(),
+                    b"stored label".to_vec(),
+                ),
+                ("application/x-richclip-ocr".into(), b"stored OCR".to_vec()),
+            ])
+            .unwrap();
+        let added = store
+            .add_item_with_result(&[
+                ("text/plain".into(), b"A".to_vec()),
+                (
+                    "application/x-richclip-label".into(),
+                    b"incoming label".to_vec(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(added.removed_ids, vec![old]);
+        assert_eq!(
+            store
+                .decode(added.id, "application/x-richclip-label")
+                .unwrap(),
+            b"incoming label"
+        );
+        assert_eq!(
+            store
+                .decode(added.id, "application/x-richclip-ocr")
+                .unwrap(),
+            b"stored OCR"
+        );
+
+        let meta_one = store
+            .add_item(&[("application/x-richclip-label".into(), b"metadata".to_vec())])
+            .unwrap();
+        let meta_two = store
+            .add_item(&[("application/x-richclip-label".into(), b"metadata".to_vec())])
+            .unwrap();
+        assert_ne!(meta_one, meta_two);
+        assert!(store.get_item(meta_one).is_ok());
+        assert!(store.get_item(meta_two).is_ok());
+    }
+
+    #[test]
+    fn matching_ignores_lifecycle_metadata_but_preserves_mime_spelling() {
+        let (mut store, _dir) = temp_store();
+        let old = store
+            .add_item(&[("text/plain;charset=utf-8".into(), b"A".to_vec())])
+            .unwrap();
+        store
+            .set_format(old, "application/x-richclip-extra", b"metadata")
+            .unwrap();
+        let new_same_mime = store
+            .add_item(&[("text/plain;charset=utf-8".into(), b"A".to_vec())])
+            .unwrap();
+        assert!(matches!(store.get_item(old), Err(Error::NotFound)));
+        assert!(
+            store
+                .formats(new_same_mime)
+                .unwrap()
+                .iter()
+                .any(|f| f.mime == "application/x-richclip-extra")
+        );
+
+        store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+        assert_eq!(store.list_items(None, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn add_failure_rolls_back_insertion_and_all_pruning() {
+        let (mut store, _dir) = temp_store();
+        let first = store
+            .add_item(&[("text/plain".into(), b"A".to_vec())])
+            .unwrap();
+        let second = store
+            .add_item(&[("text/plain".into(), b"B".to_vec())])
+            .unwrap();
+        store.set_format(second, "text/plain", b"A").unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_history_delete BEFORE DELETE ON items
+                 BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .add_item(&[("text/plain".into(), b"A".to_vec())])
+                .is_err()
+        );
+        assert_eq!(store.list_items(None, None).unwrap().len(), 2);
+        assert_eq!(store.decode(first, "text/plain").unwrap(), b"A");
+        assert_eq!(store.decode(second, "text/plain").unwrap(), b"A");
+    }
+
+    #[test]
+    fn independent_concurrent_adds_replace_each_other_and_keep_blob() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let store_a = Store::open(dir.path()).unwrap();
+        let store_b = Store::open(dir.path()).unwrap();
+        let mut workers = Vec::new();
+        for mut store in [store_a, store_b] {
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .add_item(&[("text/plain".into(), b"same bytes".to_vec())])
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let ids: Vec<Uuid> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        let store = Store::open(dir.path()).unwrap();
+        let items = store.list_items(None, None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(ids.contains(&items[0].item.id));
+        assert_eq!(
+            store.decode(items[0].item.id, "text/plain").unwrap(),
+            b"same bytes"
+        );
+    }
+
+    #[test]
+    fn blob_cleanup_racing_an_independent_add_keeps_surviving_reference() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut setup = Store::open(dir.path()).unwrap();
+        let old_id = setup
+            .add_item(&[("text/plain".into(), b"shared bytes".to_vec())])
+            .unwrap();
+        drop(setup);
+
+        let delete_store = Store::open(dir.path()).unwrap();
+        let add_store = Store::open(dir.path()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let delete_barrier = barrier.clone();
+        let deleter = std::thread::spawn(move || {
+            let mut store = delete_store;
+            delete_barrier.wait();
+            store.delete_item(old_id).unwrap();
+        });
+        let add_barrier = barrier.clone();
+        let adder = std::thread::spawn(move || {
+            let mut store = add_store;
+            add_barrier.wait();
+            store
+                .add_item(&[("text/html".into(), b"shared bytes".to_vec())])
+                .unwrap()
+        });
+        barrier.wait();
+        deleter.join().unwrap();
+        let new_id = adder.join().unwrap();
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.decode(new_id, "text/html").unwrap(), b"shared bytes");
     }
 
     #[test]
@@ -505,7 +943,7 @@ mod tests {
             .add_item(&[("text/plain".to_string(), shared.to_vec())])
             .unwrap();
         let id2 = store
-            .add_item(&[("text/plain".to_string(), shared.to_vec())])
+            .add_item(&[("text/html".to_string(), shared.to_vec())])
             .unwrap();
 
         let hash = store.formats(id1).unwrap()[0].blob_hash.clone();

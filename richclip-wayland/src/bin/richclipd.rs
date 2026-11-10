@@ -32,8 +32,10 @@ use tracing_subscriber::EnvFilter;
 
 use richclip::Store;
 use richclip::backend::{CaptureSink, CapturedItem};
-use richclip::ipc::WatchEvent;
-use richclip_wayland::{WlrDataControlBackend, daemon::DaemonState};
+use richclip_wayland::{
+    WlrDataControlBackend,
+    daemon::{DaemonState, publish_added_item},
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -140,44 +142,24 @@ async fn main() -> anyhow::Result<()> {
                 // content we most recently restored, it's our own selection
                 // echoing back through the capture device — drop it instead of
                 // creating a duplicate history entry.
-                let captured_fp: std::collections::HashSet<(String, String)> = formats
-                    .iter()
-                    .map(|(mime, bytes)| (mime.clone(), richclip::blob_hash(bytes)))
-                    .collect();
-                let is_self_restore = state_cap
-                    .suppression
-                    .lock()
-                    .map(|g| g.as_ref() == Some(&captured_fp))
-                    .unwrap_or(false);
+                let captured_fp = richclip_wayland::daemon::restore_capture_fingerprint(&formats);
+                let is_self_restore = state_cap.suppression.observe_capture(&captured_fp);
                 if is_self_restore {
                     tracing::debug!("ignoring self-restore echo");
                     continue;
                 }
 
                 let mut store = state_cap.store.lock().await;
-                match store.add_item(&formats) {
-                    Ok(id) => {
-                        let mimes: Vec<String> = formats.iter().map(|(m, _)| m.clone()).collect();
-                        let created_at = match store.get_item(id) {
-                            Ok(iwf) => iwf.item.created_at,
-                            Err(_) => time::OffsetDateTime::now_utc(),
-                        };
-                        // Best-effort thumbnail generation while holding the
-                        // store lock (avoids a second lock/clone; capture is
-                        // not high-frequency so the brief blocking is fine).
-                        if let Err(e) = richclip::thumbnail::generate_item_thumbnail(
+                match store.add_item_with_result(&formats) {
+                    Ok(added) => {
+                        let id = added.id;
+                        publish_added_item(
                             &store,
                             &state_cap.cache_dir,
-                            id,
-                        ) {
-                            warn!(%id, "thumbnail generation failed: {e}");
-                        }
+                            &state_cap.watch_tx,
+                            added,
+                        );
                         drop(store);
-                        let _ = state_cap.watch_tx.send(WatchEvent::ItemAdded {
-                            id,
-                            created_at,
-                            formats: mimes,
-                        });
                         info!(%id, "captured item stored");
                     }
                     Err(e) => {
