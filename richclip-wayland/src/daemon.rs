@@ -22,6 +22,7 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use crate::filter::{CaptureConfig, accepted_mimes};
+use richclip::backend::CapturedItem;
 use richclip::ipc::{
     AddItemParams, Request, Response, UpdateItemParams, WatchEvent, WatchEventsParams,
 };
@@ -40,6 +41,41 @@ struct RestoreMarker {
     active: bool,
 }
 
+/// Ordered messages shared by the capture backend and restore threads.
+///
+/// Keeping restore lifecycle updates in this queue makes their order relative
+/// to captured and skipped selections visible to the delayed consumer.
+pub enum CaptureMessage {
+    Item(CapturedItem),
+    SelectionSkipped,
+    Restore(RestoreSuppressionEvent),
+}
+
+/// Restore lifecycle changes applied by the capture consumer in queue order.
+pub enum RestoreSuppressionEvent {
+    Arm {
+        token: Uuid,
+        fingerprint: HashSet<(String, String)>,
+    },
+    Activate {
+        token: Uuid,
+    },
+    Clear {
+        token: Uuid,
+    },
+}
+
+impl CaptureMessage {
+    /// Apply state-only suppression updates for this ordered message.
+    pub fn apply_suppression_updates(&self, suppression: &RestoreSuppression) {
+        match self {
+            Self::Restore(event) => suppression.apply_event(event),
+            Self::SelectionSkipped => suppression.observe_skipped_selection(),
+            Self::Item(_) => {}
+        }
+    }
+}
+
 impl RestoreSuppression {
     fn arm(&self, token: Uuid, fingerprint: HashSet<(String, String)>) {
         if let Ok(mut markers) = self.0.lock() {
@@ -56,6 +92,16 @@ impl RestoreSuppression {
             && let Some(marker) = markers.iter_mut().find(|marker| marker.token == token)
         {
             marker.active = true;
+        }
+    }
+
+    fn apply_event(&self, event: &RestoreSuppressionEvent) {
+        match event {
+            RestoreSuppressionEvent::Arm { token, fingerprint } => {
+                self.arm(*token, fingerprint.clone());
+            }
+            RestoreSuppressionEvent::Activate { token } => self.activate(*token),
+            RestoreSuppressionEvent::Clear { token } => self.clear(*token),
         }
     }
 
@@ -84,7 +130,10 @@ impl RestoreSuppression {
             });
             true
         } else {
-            markers.retain(|marker| !marker.active);
+            // The queue establishes that every marker currently present
+            // precedes this selection, including markers whose activation
+            // update may still be queued behind it.
+            markers.clear();
             false
         }
     }
@@ -104,7 +153,7 @@ impl RestoreSuppression {
     /// selection that cannot be delivered as an item.
     pub fn observe_skipped_selection(&self) {
         if let Ok(mut markers) = self.0.lock() {
-            markers.retain(|marker| !marker.active);
+            markers.clear();
         }
     }
 }
@@ -129,6 +178,10 @@ pub struct DaemonState {
     /// remain pending after an active source is cancelled because its echo may
     /// already be queued.
     pub suppression: RestoreSuppression,
+
+    /// Ordered channel shared by capture observations and restore lifecycle
+    /// updates. The daemon wires its consumer before accepting IPC requests.
+    capture_tx: Option<tokio::sync::mpsc::UnboundedSender<CaptureMessage>>,
 }
 
 impl DaemonState {
@@ -139,7 +192,17 @@ impl DaemonState {
             watch_tx,
             cache_dir,
             suppression: RestoreSuppression::default(),
+            capture_tx: None,
         }
+    }
+
+    /// Connect the ordered capture consumer channel used for restore updates.
+    pub fn with_capture_events(
+        mut self,
+        capture_tx: tokio::sync::mpsc::UnboundedSender<CaptureMessage>,
+    ) -> Self {
+        self.capture_tx = Some(capture_tx);
+        self
     }
 }
 
@@ -380,6 +443,10 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
         return Response::err("item has no advertisable formats", "error");
     }
 
+    let Some(capture_tx) = state.capture_tx.clone() else {
+        return Response::err("restore capture event queue is not configured", "error");
+    };
+
     // ── 3. Build suppression fingerprint ─────────────────────────────────────
     let fingerprint = restore_capture_fingerprint(&formats);
 
@@ -389,16 +456,27 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
     // RUNTIME-UNVERIFIED: run_restore connects to Wayland and blocks until
     // the source is cancelled (another selection replaces ours).
     let token = Uuid::now_v7();
-    let suppression = state.suppression.clone();
+    let arm_tx = capture_tx.clone();
+    let activate_tx = capture_tx.clone();
     std::thread::spawn(move || {
-        let arm = suppression.clone();
-        let activate = suppression.clone();
         let result = crate::restore::run_restore_with_callbacks(
             formats,
-            move || arm.arm(token, fingerprint),
-            move || activate.activate(token),
+            move || {
+                let _ = arm_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
+                    token,
+                    fingerprint,
+                }));
+            },
+            move || {
+                let _ =
+                    activate_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
+                        token,
+                    }));
+            },
         );
-        suppression.clear(token);
+        let _ = capture_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
+            token,
+        }));
         if let Err(e) = result {
             tracing::warn!("restore thread exited with error: {e}");
         }
@@ -595,6 +673,152 @@ mod tests {
 
         suppression.observe_skipped_selection(); // e.g. clipboard cleared/unsupported
         assert!(!suppression.observe_capture(&restored));
+    }
+
+    fn captured_item(mime: &str, bytes: &[u8]) -> CaptureMessage {
+        CaptureMessage::Item(CapturedItem {
+            formats: vec![richclip::backend::CapturedFormat {
+                mime: mime.into(),
+                bytes: bytes.to_vec(),
+            }],
+        })
+    }
+
+    fn apply_queued_message(
+        suppression: &RestoreSuppression,
+        message: CaptureMessage,
+    ) -> Option<bool> {
+        message.apply_suppression_updates(suppression);
+        match message {
+            CaptureMessage::Item(item) => {
+                let formats: Vec<(String, Vec<u8>)> = item
+                    .formats
+                    .into_iter()
+                    .map(|format| (format.mime, format.bytes))
+                    .collect();
+                let fingerprint = restore_capture_fingerprint(&formats);
+                Some(suppression.observe_capture(&fingerprint))
+            }
+            CaptureMessage::SelectionSkipped | CaptureMessage::Restore(_) => None,
+        }
+    }
+
+    fn check_delayed_consumer(intervening_capture: bool) {
+        let restored = fingerprint("text/plain", b"A");
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Queue restore A and its echo without consuming either message.
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
+            token: first,
+            fingerprint: restored.clone(),
+        }))
+        .unwrap();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
+            token: first,
+        }))
+        .unwrap();
+        tx.send(captured_item("text/plain", b"A")).unwrap();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
+            token: first,
+        }))
+        .unwrap();
+
+        // Queue a different copy or a skipped selection after the first
+        // restore, then queue a second restore before the consumer catches up.
+        if intervening_capture {
+            tx.send(captured_item("text/plain", b"B")).unwrap();
+        } else {
+            tx.send(CaptureMessage::SelectionSkipped).unwrap();
+        }
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
+            token: second,
+            fingerprint: restored,
+        }))
+        .unwrap();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
+            token: second,
+        }))
+        .unwrap();
+        tx.send(captured_item("text/plain", b"A")).unwrap();
+        // A later genuine copy must still be accepted.
+        tx.send(captured_item("text/plain", b"A")).unwrap();
+
+        let suppression = RestoreSuppression::default();
+        let outcomes: Vec<_> = std::iter::from_fn(|| {
+            rx.try_recv()
+                .ok()
+                .map(|message| apply_queued_message(&suppression, message))
+        })
+        .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                None,
+                None,
+                Some(true),
+                None,
+                if intervening_capture {
+                    Some(false)
+                } else {
+                    None
+                },
+                None,
+                None,
+                Some(true),
+                Some(false),
+            ],
+            "an older queued selection must not retire a later restore echo marker"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn review_queued_copy_between_restores_preserves_new_echo() {
+        check_delayed_consumer(true);
+    }
+
+    #[test]
+    fn review_queued_clear_between_restores_preserves_new_echo() {
+        check_delayed_consumer(false);
+    }
+
+    #[test]
+    fn older_selection_cannot_revive_pending_restore_marker() {
+        let suppression = RestoreSuppression::default();
+        let token = Uuid::now_v7();
+        let restored = fingerprint("text/plain", b"A");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
+            token,
+            fingerprint: restored,
+        }))
+        .unwrap();
+        tx.send(captured_item("text/plain", b"B")).unwrap();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
+            token,
+        }))
+        .unwrap();
+        tx.send(captured_item("text/plain", b"A")).unwrap();
+
+        assert_eq!(
+            apply_queued_message(&suppression, rx.try_recv().unwrap()),
+            None
+        );
+        assert_eq!(
+            apply_queued_message(&suppression, rx.try_recv().unwrap()),
+            Some(false)
+        );
+        assert_eq!(
+            apply_queued_message(&suppression, rx.try_recv().unwrap()),
+            None
+        );
+        assert_eq!(
+            apply_queued_message(&suppression, rx.try_recv().unwrap()),
+            Some(false)
+        );
     }
 
     #[test]
