@@ -151,6 +151,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                     Some(o) => o,
                     None => {
                         // Clipboard cleared; nothing to capture.
+                        state.sink.selection_skipped();
                         return;
                     }
                 };
@@ -166,6 +167,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                             "Selection event for unknown offer {:?}; skipping",
                             offer.id()
                         );
+                        state.sink.selection_skipped();
                         return;
                     }
                 };
@@ -178,6 +180,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                     );
                     // Clean up.
                     state.offers.remove(&offer.id());
+                    state.sink.selection_skipped();
                     return;
                 }
 
@@ -186,6 +189,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 if accepted.is_empty() {
                     tracing::debug!("No accepted MIMEs in offer {:?}; skipping", offer.id());
                     state.offers.remove(&offer.id());
+                    state.sink.selection_skipped();
                     return;
                 }
 
@@ -217,6 +221,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                             };
                             if !retain_format(&mut formats, format) {
                                 state.offers.remove(&offer.id());
+                                state.sink.selection_skipped();
                                 return;
                             }
                             total_bytes =
@@ -246,6 +251,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
 
                 if formats.is_empty() {
                     tracing::debug!("No formats captured after drain; discarding item");
+                    state.sink.selection_skipped();
                     return;
                 }
 

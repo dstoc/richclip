@@ -11,7 +11,7 @@
 //! connections are long-lived: events are streamed until the client disconnects
 //! (detected by a write error).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,7 +32,7 @@ use richclip::{AddItemResult, Store};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
-pub struct RestoreSuppression(Arc<std::sync::Mutex<Option<RestoreMarker>>>);
+pub struct RestoreSuppression(Arc<std::sync::Mutex<VecDeque<RestoreMarker>>>);
 
 struct RestoreMarker {
     token: Uuid,
@@ -42,8 +42,8 @@ struct RestoreMarker {
 
 impl RestoreSuppression {
     fn arm(&self, token: Uuid, fingerprint: HashSet<(String, String)>) {
-        if let Ok(mut marker) = self.0.lock() {
-            *marker = Some(RestoreMarker {
+        if let Ok(mut markers) = self.0.lock() {
+            markers.push_back(RestoreMarker {
                 token,
                 fingerprint,
                 active: false,
@@ -52,42 +52,59 @@ impl RestoreSuppression {
     }
 
     fn activate(&self, token: Uuid) {
-        if let Ok(mut marker) = self.0.lock()
-            && let Some(marker) = marker.as_mut()
-            && marker.token == token
+        if let Ok(mut markers) = self.0.lock()
+            && let Some(marker) = markers.iter_mut().find(|marker| marker.token == token)
         {
             marker.active = true;
         }
     }
 
-    /// Consume the restore echo once. A different capture clears an active
-    /// marker, so a later genuine copy of the restored content reaches Store.
+    /// Consume one matching restore echo. Keep separate markers for repeated
+    /// restores because their captures may already be queued when the consumer
+    /// reaches them. A different capture clears older active markers so a later
+    /// genuine copy of the restored content reaches Store.
     pub fn observe_capture(&self, fingerprint: &HashSet<(String, String)>) -> bool {
-        let Ok(mut marker) = self.0.lock() else {
-            return false;
-        };
-        let Some(current) = marker.as_ref() else {
+        let Ok(mut markers) = self.0.lock() else {
             return false;
         };
 
-        if &current.fingerprint == fingerprint {
-            *marker = None;
+        let matching_token = markers
+            .iter()
+            .find(|marker| &marker.fingerprint == fingerprint)
+            .map(|marker| marker.token);
+        if let Some(matching_token) = matching_token {
+            let mut passed_match = false;
+            markers.retain(|marker| {
+                if marker.token == matching_token {
+                    passed_match = true;
+                    false
+                } else {
+                    passed_match || !marker.active
+                }
+            });
             true
         } else {
-            if current.active {
-                *marker = None;
-            }
+            markers.retain(|marker| !marker.active);
             false
         }
     }
 
     fn clear(&self, token: Uuid) {
-        if let Ok(mut marker) = self.0.lock()
-            && marker
-                .as_ref()
-                .is_some_and(|current| current.token == token)
-        {
-            *marker = None;
+        if let Ok(mut markers) = self.0.lock() {
+            // A restore that never activated cannot have produced an echo and
+            // should not leave state behind after a failed setup. An activated
+            // marker remains until its echo or a subsequent different capture
+            // is observed; the echo may already be queued when its source is
+            // cancelled by a newer selection.
+            markers.retain(|marker| marker.token != token || marker.active);
+        }
+    }
+
+    /// Retire active markers when the capture backend reports a clipboard
+    /// selection that cannot be delivered as an item.
+    pub fn observe_skipped_selection(&self) {
+        if let Ok(mut markers) = self.0.lock() {
+            markers.retain(|marker| !marker.active);
         }
     }
 }
@@ -106,10 +123,11 @@ pub struct DaemonState {
 
     /// Self-capture suppression marker.
     ///
-    /// The capture consumer checks captures against the active restore's
-    /// fingerprint. It consumes one matching echo, clears on the next different
-    /// capture or when that restore fails or is cancelled, and leaves an
-    /// awaiting marker in place while the selection request is being flushed.
+    /// The capture consumer checks captures against restore fingerprints in
+    /// selection order. It consumes one matching echo per restore and clears
+    /// older markers on a different capture or skipped selection. Markers
+    /// remain pending after an active source is cancelled because its echo may
+    /// already be queued.
     pub suppression: RestoreSuppression,
 }
 
@@ -159,16 +177,28 @@ pub fn publish_added_item(
 /// and first-base-type-wins behavior.
 pub fn restore_capture_fingerprint(formats: &[(String, Vec<u8>)]) -> HashSet<(String, String)> {
     let offered: Vec<String> = formats.iter().map(|(mime, _)| mime.clone()).collect();
-    accepted_mimes(&CaptureConfig::default(), &offered)
-        .into_iter()
-        .filter_map(|accepted| {
-            let bytes = formats
-                .iter()
-                .find(|(mime, _)| *mime == accepted.offered)
-                .map(|(_, bytes)| bytes)?;
-            Some((accepted.store_as, richclip::blob_hash(bytes)))
-        })
-        .collect()
+    let config = CaptureConfig::default();
+    let mut total_bytes = 0;
+    let mut fingerprint = HashSet::new();
+
+    for accepted in accepted_mimes(&config, &offered) {
+        let Some(bytes) = formats
+            .iter()
+            .find(|(mime, _)| *mime == accepted.offered)
+            .map(|(_, bytes)| bytes)
+        else {
+            continue;
+        };
+
+        // capture.rs stops accepting formats at the first size-limit failure.
+        if !crate::filter::within_size_limits(&config, total_bytes, bytes.len()) {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        fingerprint.insert((accepted.store_as, richclip::blob_hash(bytes)));
+    }
+
+    fingerprint
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +534,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_restores_preserve_each_queued_echo() {
+        let suppression = RestoreSuppression::default();
+        let restored = fingerprint("text/plain", b"A");
+        let first_token = Uuid::now_v7();
+        let second_token = Uuid::now_v7();
+
+        suppression.arm(first_token, restored.clone());
+        suppression.activate(first_token);
+        suppression.arm(second_token, restored.clone());
+        suppression.activate(second_token);
+        suppression.clear(first_token); // first source is superseded
+
+        // The capture consumer can be behind both completed captures.
+        assert!(suppression.observe_capture(&restored));
+        assert!(suppression.observe_capture(&restored));
+        assert!(!suppression.observe_capture(&restored));
+    }
+
+    #[test]
     fn different_capture_clears_marker_before_a_later_copy() {
         let suppression = RestoreSuppression::default();
         let token = Uuid::now_v7();
@@ -517,24 +566,70 @@ mod tests {
     }
 
     #[test]
-    fn failed_or_cancelled_restore_clears_only_its_marker() {
+    fn failed_and_cancelled_restores_do_not_leave_stale_markers() {
         let suppression = RestoreSuppression::default();
-        let old_token = Uuid::now_v7();
-        let new_token = Uuid::now_v7();
-        let old = fingerprint("text/plain", b"A");
-        let new = fingerprint("text/plain", b"B");
+        let restored = fingerprint("text/plain", b"A");
+        let other = fingerprint("text/plain", b"B");
 
-        suppression.arm(old_token, old);
-        suppression.clear(old_token); // failed before selection
-        suppression.arm(new_token, new.clone());
-        suppression.clear(old_token); // prior restore exits after replacement
+        let failed_token = Uuid::now_v7();
+        suppression.arm(failed_token, restored.clone());
+        suppression.clear(failed_token); // failed before selection was activated
+        assert!(!suppression.observe_capture(&restored));
 
-        assert!(suppression.observe_capture(&new));
         let cancelled_token = Uuid::now_v7();
-        suppression.arm(cancelled_token, new.clone());
+        suppression.arm(cancelled_token, restored.clone());
         suppression.activate(cancelled_token);
-        suppression.clear(cancelled_token); // cancelled restore
-        assert!(!suppression.observe_capture(&new));
+        suppression.clear(cancelled_token); // its queued echo may still arrive
+        assert!(!suppression.observe_capture(&other)); // a new selection retires it
+        assert!(!suppression.observe_capture(&restored)); // genuine later copy
+    }
+
+    #[test]
+    fn skipped_selection_retires_cancelled_restore_marker() {
+        let suppression = RestoreSuppression::default();
+        let restored = fingerprint("text/plain", b"A");
+        let token = Uuid::now_v7();
+        suppression.arm(token, restored.clone());
+        suppression.activate(token);
+        suppression.clear(token);
+
+        suppression.observe_skipped_selection(); // e.g. clipboard cleared/unsupported
+        assert!(!suppression.observe_capture(&restored));
+    }
+
+    #[test]
+    fn restore_fingerprint_stops_at_per_format_size_limit() {
+        let config = CaptureConfig::default();
+        let formats = vec![
+            ("image/jpeg".into(), b"small image".to_vec()),
+            ("image/png".into(), vec![0; config.max_format_bytes + 1]),
+        ];
+
+        assert_eq!(
+            restore_capture_fingerprint(&formats),
+            fingerprint("image/jpeg", b"small image")
+        );
+    }
+
+    #[test]
+    fn restore_fingerprint_stops_at_total_size_limit() {
+        let config = CaptureConfig::default();
+        let jpeg = vec![0x11; config.max_format_bytes];
+        let png = vec![0x22; config.max_format_bytes];
+        let webp = vec![0x33; 1];
+        let formats = vec![
+            ("image/jpeg".into(), jpeg.clone()),
+            ("image/png".into(), png.clone()),
+            ("image/webp".into(), webp),
+        ];
+
+        assert_eq!(
+            restore_capture_fingerprint(&formats),
+            HashSet::from([
+                ("image/jpeg".into(), richclip::blob_hash(&jpeg)),
+                ("image/png".into(), richclip::blob_hash(&png)),
+            ])
+        );
     }
 
     #[test]

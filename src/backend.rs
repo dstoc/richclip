@@ -26,6 +26,7 @@ pub struct CapturedItem {
 /// [`ClipboardBackend::run_capture_loop`].
 pub struct CaptureSink {
     handler: Box<dyn FnMut(CapturedItem) + Send>,
+    selection_skipped_handler: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl CaptureSink {
@@ -34,12 +35,34 @@ impl CaptureSink {
     pub fn new(handler: impl FnMut(CapturedItem) + Send + 'static) -> Self {
         Self {
             handler: Box::new(handler),
+            selection_skipped_handler: None,
         }
+    }
+
+    /// Register a callback for clipboard selections that the backend does not
+    /// deliver as items, such as an empty, unsupported, or filtered selection.
+    ///
+    /// Restore echo suppression uses this notification to retire pending
+    /// markers when the clipboard changes to content that cannot be captured.
+    pub fn with_selection_skipped_handler(
+        mut self,
+        handler: impl FnMut() + Send + 'static,
+    ) -> Self {
+        self.selection_skipped_handler = Some(Box::new(handler));
+        self
     }
 
     /// Deliver a captured item to the handler.
     pub fn push(&mut self, item: CapturedItem) {
         (self.handler)(item)
+    }
+
+    /// Notify the handler that the current clipboard selection will not be
+    /// delivered as a captured item.
+    pub fn selection_skipped(&mut self) {
+        if let Some(handler) = self.selection_skipped_handler.as_mut() {
+            handler();
+        }
     }
 }
 

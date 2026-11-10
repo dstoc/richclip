@@ -50,6 +50,11 @@ const WATCH_CHANNEL_CAPACITY: usize = 256;
 /// How long to wait between retention prune passes.
 const PRUNE_INTERVAL_SECS: u64 = 3600; // 1 hour
 
+enum CaptureMessage {
+    Item(CapturedItem),
+    SelectionSkipped,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -109,12 +114,16 @@ async fn main() -> anyhow::Result<()> {
     // ── 6. Spawn capture task (best-effort; skip if no compositor) ────────────
     {
         let state_cap = state.clone();
-        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedItem>();
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<CaptureMessage>();
+        let skipped_tx = cap_tx.clone();
 
         // Spawn the Wayland capture loop in a blocking thread.
         tokio::spawn(async move {
             let sink = CaptureSink::new(move |item: CapturedItem| {
-                let _ = cap_tx.send(item);
+                let _ = cap_tx.send(CaptureMessage::Item(item));
+            })
+            .with_selection_skipped_handler(move || {
+                let _ = skipped_tx.send(CaptureMessage::SelectionSkipped);
             });
             match WlrDataControlBackend::new() {
                 Ok(mut backend) => {
@@ -131,20 +140,25 @@ async fn main() -> anyhow::Result<()> {
 
         // Spawn consumer that converts CapturedItems into store writes + events.
         tokio::spawn(async move {
-            while let Some(item) = cap_rx.recv().await {
+            while let Some(message) = cap_rx.recv().await {
+                let item = match message {
+                    CaptureMessage::Item(item) => item,
+                    CaptureMessage::SelectionSkipped => {
+                        state_cap.suppression.observe_skipped_selection();
+                        continue;
+                    }
+                };
                 let formats: Vec<(String, Vec<u8>)> = item
                     .formats
                     .into_iter()
                     .map(|f| (f.mime, f.bytes))
                     .collect();
 
-                // Self-capture suppression: if this capture exactly matches the
-                // content we most recently restored, it's our own selection
-                // echoing back through the capture device — drop it instead of
-                // creating a duplicate history entry.
+                // Self-capture suppression: consume each restore echo once.
+                // The item and skipped-selection notifications share one
+                // ordered channel so a delayed consumer preserves capture order.
                 let captured_fp = richclip_wayland::daemon::restore_capture_fingerprint(&formats);
-                let is_self_restore = state_cap.suppression.observe_capture(&captured_fp);
-                if is_self_restore {
+                if state_cap.suppression.observe_capture(&captured_fp) {
                     tracing::debug!("ignoring self-restore echo");
                     continue;
                 }
