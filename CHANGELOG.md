@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.4](https://github.com/dstoc/richclip/compare/richclip-v0.1.3...richclip-v0.1.4) (2026-11-10)
+
+
+### Features
+
+* deduplicate clipboard history on add ([#9](https://github.com/dstoc/richclip/issues/9)) ([6ac7f21](https://github.com/dstoc/richclip/commit/6ac7f21e7d1db887ffbf7dc4de3f4097c05c09d2))
+
+
+### Bug Fixes
+
+* combine workspace release pull requests ([#7](https://github.com/dstoc/richclip/issues/7)) ([89ee9ef](https://github.com/dstoc/richclip/commit/89ee9ef8d4ef2fd15467f4f0b1f4bc0030318bb4))
+
 ## [0.1.3](https://github.com/dstoc/richclip/compare/richclip-v0.1.2...richclip-v0.1.3) (2026-10-29)
 
 
