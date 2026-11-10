@@ -555,7 +555,19 @@ fn cmd_add(cli_data_dir: &Option<PathBuf>, args: AddArgs) -> Result<(), AppError
 
     // No daemon: direct DB write (Phase-1 fallback).
     let mut store = open_store(cli_data_dir)?;
-    let id = store.add_item(&formats)?;
+    let added = store.add_item_with_result(&formats)?;
+    let id = added.id;
+    if let Some(error) = &added.blob_cleanup_error {
+        eprintln!("warning: blob cleanup after add failed: {error}");
+    }
+
+    // Replacement removes old item rows at the store boundary. Clean their
+    // cache files here, where the CLI owns thumbnail side effects.
+    if let Ok(cd) = cache_dir() {
+        for removed_id in added.removed_ids {
+            let _ = std::fs::remove_file(richclip::paths::thumb_path(&cd, removed_id));
+        }
+    }
 
     // Best-effort thumbnail generation.  Print the id first so output is
     // correct even on thumbnail failure; then attempt generation and warn on

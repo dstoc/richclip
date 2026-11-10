@@ -23,7 +23,7 @@ pub mod thumbnail;
 // Convenience re-exports so callers don't have to spell out sub-modules.
 pub use error::{Error, Result};
 pub use model::{Format, Item, ItemWithFormats};
-pub use store::Store;
+pub use store::{AddItemResult, Store};
 
 /// Compute the blake3 hex digest of `bytes`.
 ///

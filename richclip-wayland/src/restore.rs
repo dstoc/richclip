@@ -262,6 +262,17 @@ fn write_blob_to_fd(fd: OwnedFd, bytes: Option<&[u8]>, mime_type: &str) {
 /// This entire function is unverified without a live compositor.  See module
 /// doc comment for the full list of unverified aspects.
 pub fn run_restore(formats: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
+    run_restore_with_callbacks(formats, || {}, || {})
+}
+
+/// Restore formats and notify the caller immediately before selection is
+/// requested and after the compositor has processed the flushed request. The daemon uses these
+/// hooks to scope its one-shot echo marker to this restore operation.
+pub fn run_restore_with_callbacks(
+    formats: Vec<(String, Vec<u8>)>,
+    before_selection: impl FnOnce(),
+    after_selection: impl FnOnce(),
+) -> anyhow::Result<()> {
     // ── 1. Connect ────────────────────────────────────────────────────────────
     // RUNTIME-UNVERIFIED: Requires $WAYLAND_DISPLAY to be set and reachable.
     let conn = Connection::connect_to_env()?;
@@ -299,6 +310,7 @@ pub fn run_restore(formats: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
     // RUNTIME-UNVERIFIED: set_selection transfers ownership to our source.
     // The compositor will deliver a `Cancelled` event on the *previous* owner's
     // source (if any) and a `Selection` event to all data-control listeners.
+    before_selection();
     device.set_selection(Some(&source));
 
     // Flush all queued requests to the compositor before entering the loop.
@@ -311,6 +323,13 @@ pub fn run_restore(formats: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
         source,
         done: false,
     };
+
+    // Confirm that the compositor processed set_selection before the daemon
+    // places its activation event behind the corresponding capture-side event
+    // batch. This roundtrip also dispatches an immediate cancellation if a
+    // newer selection superseded the restore during setup.
+    event_queue.roundtrip(&mut state)?;
+    after_selection();
 
     // ── 7. Dispatch loop ──────────────────────────────────────────────────────
     // Block until events arrive, dispatch them, then check `done`.

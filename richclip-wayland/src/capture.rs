@@ -23,11 +23,14 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_registry, wl_seat::WlSeat},
+    protocol::{wl_callback, wl_registry, wl_seat::WlSeat},
 };
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
@@ -35,7 +38,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
 };
 
-use richclip::backend::{CaptureSink, CapturedFormat, CapturedItem};
+use richclip::backend::{CaptureOrderingBarrier, CaptureSink, CapturedFormat, CapturedItem};
 
 use crate::filter::{self, CaptureConfig};
 
@@ -55,6 +58,11 @@ struct State {
 
     /// The connection handle; stored so `Dispatch` impls can call `flush()`.
     conn: Connection,
+    /// Barrier callbacks are acknowledged after the current event batch has
+    /// been fully dispatched, so preceding selection callbacks have already
+    /// published their ordered messages.
+    barrier_completions: Vec<u64>,
+    barrier_waiters: Arc<BarrierCompletions>,
     // TODO (P2-M4 restore milestone): When the daemon owns the current
     // selection (after a `restore_item` call), record the source object ID
     // here so that `Selection` events for that offer can be short-circuited
@@ -64,6 +72,65 @@ struct State {
     //
     // The check would look like:
     //   if Some(offer.id()) == state.owned_source_id { return; }
+}
+
+impl State {
+    fn complete_ordering_barriers(&mut self) {
+        for request_id in self.barrier_completions.drain(..) {
+            self.barrier_waiters.complete(request_id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BarrierCompletions {
+    next_id: AtomicU64,
+    waiters: Mutex<HashMap<u64, Sender<Result<(), String>>>>,
+}
+
+impl BarrierCompletions {
+    fn register(&self, completion: Sender<Result<(), String>>) -> Result<u64, String> {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.waiters
+            .lock()
+            .map_err(|_| "capture barrier waiter state was poisoned".to_string())?
+            .insert(request_id, completion);
+        Ok(request_id)
+    }
+
+    fn complete(&self, request_id: u64) {
+        let completion = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
+        if let Some(completion) = completion {
+            let _ = completion.send(Ok(()));
+        }
+    }
+
+    fn fail(&self, request_id: u64, error: String) {
+        let completion = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
+        if let Some(completion) = completion {
+            let _ = completion.send(Err(error));
+        }
+    }
+
+    fn fail_all(&self, error: String) {
+        let waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (_, completion) in waiters {
+            let _ = completion.send(Err(error.clone()));
+        }
+    }
 }
 
 // ─── Dispatch<WlRegistry, GlobalListContents> ─────────────────────────────────
@@ -81,6 +148,24 @@ impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListConten
         // Dynamic global add/remove events after initial enumeration. We do
         // not handle hot-plug of the data-control manager or seats; restart
         // the daemon if the compositor's global list changes significantly.
+    }
+}
+
+// Restore threads send wl_display.sync on the capture connection and wait for
+// this callback. The acknowledgement is deferred until blocking_dispatch
+// returns, after every event in that read batch has run its handler.
+impl Dispatch<wl_callback::WlCallback, u64> for State {
+    fn event(
+        state: &mut Self,
+        _callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        request_id: &u64,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.barrier_completions.push(*request_id);
+        }
     }
 }
 
@@ -145,12 +230,18 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
             }
 
             zwlr_data_control_device_v1::Event::Selection { id } => {
+                // Publish the selection's position before any MIME filtering
+                // or blocking format drain. The item callback may run much
+                // later, but its ID still reflects when this event began.
+                let selection_id = state.sink.selection_started();
+
                 // `id` is `Option<ZwlrDataControlOfferV1>`; `None` means the
                 // selection was cleared (clipboard is empty).
                 let offer = match id {
                     Some(o) => o,
                     None => {
                         // Clipboard cleared; nothing to capture.
+                        state.sink.selection_skipped_for(selection_id);
                         return;
                     }
                 };
@@ -166,6 +257,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                             "Selection event for unknown offer {:?}; skipping",
                             offer.id()
                         );
+                        state.sink.selection_skipped_for(selection_id);
                         return;
                     }
                 };
@@ -178,6 +270,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                     );
                     // Clean up.
                     state.offers.remove(&offer.id());
+                    state.sink.selection_skipped_for(selection_id);
                     return;
                 }
 
@@ -186,6 +279,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 if accepted.is_empty() {
                     tracing::debug!("No accepted MIMEs in offer {:?}; skipping", offer.id());
                     state.offers.remove(&offer.id());
+                    state.sink.selection_skipped_for(selection_id);
                     return;
                 }
 
@@ -217,6 +311,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                             };
                             if !retain_format(&mut formats, format) {
                                 state.offers.remove(&offer.id());
+                                state.sink.selection_skipped_for(selection_id);
                                 return;
                             }
                             total_bytes =
@@ -246,10 +341,13 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
 
                 if formats.is_empty() {
                     tracing::debug!("No formats captured after drain; discarding item");
+                    state.sink.selection_skipped_for(selection_id);
                     return;
                 }
 
-                state.sink.push(CapturedItem { formats });
+                state
+                    .sink
+                    .push_for_selection(selection_id, CapturedItem { formats });
             }
 
             zwlr_data_control_device_v1::Event::PrimarySelection { .. } => {
@@ -419,10 +517,33 @@ pub fn run_capture(config: CaptureConfig, sink: CaptureSink) -> anyhow::Result<(
         sink,
         offers: HashMap::new(),
         conn: conn.clone(),
+        barrier_completions: Vec::new(),
+        barrier_waiters: Arc::new(BarrierCompletions::default()),
     };
 
+    let barrier_conn = conn.clone();
+    let barrier_qh = qh.clone();
+    let barrier_waiters = state.barrier_waiters.clone();
+    let ordering_barrier: CaptureOrderingBarrier = std::sync::Arc::new(move || {
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let request_id = barrier_waiters.register(completion_tx)?;
+        let _callback = barrier_conn.display().sync(&barrier_qh, request_id);
+        if let Err(error) = barrier_conn.flush() {
+            let error = error.to_string();
+            barrier_waiters.fail(request_id, error.clone());
+            return Err(error);
+        }
+        completion_rx.recv().map_err(|error| error.to_string())?
+    });
+    state.sink.capture_initialized(ordering_barrier);
+
     // Flush the requests above before entering the dispatch loop.
-    event_queue.flush()?;
+    if let Err(error) = event_queue.flush() {
+        state.barrier_waiters.fail_all(format!(
+            "capture loop failed to flush initial requests: {error}"
+        ));
+        return Err(error.into());
+    }
 
     // Main event loop: block until events arrive, dispatch them, repeat.
     //
@@ -430,7 +551,15 @@ pub fn run_capture(config: CaptureConfig, sink: CaptureSink) -> anyhow::Result<(
     // above. `blocking_dispatch` returns `Err` when the compositor closes
     // the connection, which propagates up as our return value.
     loop {
-        event_queue.blocking_dispatch(&mut state)?;
+        match event_queue.blocking_dispatch(&mut state) {
+            Ok(_) => state.complete_ordering_barriers(),
+            Err(error) => {
+                state.barrier_waiters.fail_all(format!(
+                    "capture loop exited before barrier completed: {error}"
+                ));
+                return Err(error.into());
+            }
+        }
     }
 }
 

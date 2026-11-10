@@ -167,6 +167,21 @@ another format. There is no soft-delete tombstone and no deferred GC pass —
 cleanup happens inline with the delete. A blob is removable once no `formats`
 row points at its `blob_hash`.
 
+### Add-time duplicate handling
+
+When a new item has the same complete set of stored clipboard MIME types and
+blob hashes as an older item, richclip keeps the new item and removes every
+matching older item. MIME order, item IDs, and timestamps do not affect this
+comparison. Internal `application/x-richclip-*` formats such as labels and OCR
+do not affect equality. If the new item does not include an internal format,
+richclip copies that format from the newest matching older item. An incoming
+value for the same internal MIME takes precedence.
+
+Items with no clipboard MIME formats are not deduplicated. Adding text alone
+and adding the same text with HTML remain distinct because the MIME sets differ.
+MIME names and bytes otherwise match exactly as stored. Existing update
+operations can still make two items equal; deduplication runs on add.
+
 ---
 
 ## CLI proposal
@@ -709,12 +724,6 @@ The main ones I’d settle early:
 What should the default retention window be?
   Some default (e.g. 30d) with auto-prune. The exact value/units are open.
   Deletion itself is settled: immediate, blobs cleaned inline.
-
-Should duplicate clipboard selections create new history rows?
-  Probably configurable:
-    dedupe by comparing captured formats (set of (mime, blob_hash)) by default
-    bump updated_at maybe
-    optional keep duplicates
 
 Should the daemon capture all MIME types?
   No. Use allowlist + size limits first (and skip sensitive offers).
