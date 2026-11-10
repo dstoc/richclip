@@ -25,8 +25,12 @@ pub struct CapturedItem {
 /// Construct with [`CaptureSink::new`], then pass to
 /// [`ClipboardBackend::run_capture_loop`].
 pub struct CaptureSink {
-    handler: Box<dyn FnMut(CapturedItem) + Send>,
+    handler: Option<Box<dyn FnMut(CapturedItem) + Send>>,
     selection_skipped_handler: Option<Box<dyn FnMut() + Send>>,
+    selection_started_handler: Option<Box<dyn FnMut(u64) + Send>>,
+    ordered_handler: Option<Box<dyn FnMut(u64, CapturedItem) + Send>>,
+    ordered_selection_skipped_handler: Option<Box<dyn FnMut(u64) + Send>>,
+    next_selection_id: u64,
 }
 
 impl CaptureSink {
@@ -34,8 +38,32 @@ impl CaptureSink {
     /// completed clipboard selection, on whatever thread the capture loop runs.
     pub fn new(handler: impl FnMut(CapturedItem) + Send + 'static) -> Self {
         Self {
-            handler: Box::new(handler),
+            handler: Some(Box::new(handler)),
             selection_skipped_handler: None,
+            selection_started_handler: None,
+            ordered_handler: None,
+            ordered_selection_skipped_handler: None,
+            next_selection_id: 0,
+        }
+    }
+
+    /// Create a sink that reports when each selection starts and associates its
+    /// eventual item or skipped-selection notification with that start.
+    ///
+    /// This is useful when a backend can block while reading clipboard data:
+    /// consumers can preserve selection order even when delivery happens later.
+    pub fn new_ordered(
+        started_handler: impl FnMut(u64) + Send + 'static,
+        item_handler: impl FnMut(u64, CapturedItem) + Send + 'static,
+        selection_skipped_handler: impl FnMut(u64) + Send + 'static,
+    ) -> Self {
+        Self {
+            handler: None,
+            selection_skipped_handler: None,
+            selection_started_handler: Some(Box::new(started_handler)),
+            ordered_handler: Some(Box::new(item_handler)),
+            ordered_selection_skipped_handler: Some(Box::new(selection_skipped_handler)),
+            next_selection_id: 0,
         }
     }
 
@@ -54,7 +82,30 @@ impl CaptureSink {
 
     /// Deliver a captured item to the handler.
     pub fn push(&mut self, item: CapturedItem) {
-        (self.handler)(item)
+        if let Some(handler) = self.handler.as_mut() {
+            handler(item);
+        } else {
+            panic!("ordered capture sink requires push_for_selection");
+        }
+    }
+
+    /// Mark the start of a backend selection event and return its local ID.
+    pub fn selection_started(&mut self) -> u64 {
+        self.next_selection_id = self.next_selection_id.wrapping_add(1);
+        let selection_id = self.next_selection_id;
+        if let Some(handler) = self.selection_started_handler.as_mut() {
+            handler(selection_id);
+        }
+        selection_id
+    }
+
+    /// Deliver an item with the ID returned by [`Self::selection_started`].
+    pub fn push_for_selection(&mut self, selection_id: u64, item: CapturedItem) {
+        if let Some(handler) = self.ordered_handler.as_mut() {
+            handler(selection_id, item);
+        } else {
+            self.push(item);
+        }
     }
 
     /// Notify the handler that the current clipboard selection will not be
@@ -62,6 +113,18 @@ impl CaptureSink {
     pub fn selection_skipped(&mut self) {
         if let Some(handler) = self.selection_skipped_handler.as_mut() {
             handler();
+        } else if self.ordered_selection_skipped_handler.is_some() {
+            panic!("ordered capture sink requires selection_skipped_for");
+        }
+    }
+
+    /// Notify the handler that the selection with this ID will not be
+    /// delivered as an item.
+    pub fn selection_skipped_for(&mut self, selection_id: u64) {
+        if let Some(handler) = self.ordered_selection_skipped_handler.as_mut() {
+            handler(selection_id);
+        } else {
+            self.selection_skipped();
         }
     }
 }

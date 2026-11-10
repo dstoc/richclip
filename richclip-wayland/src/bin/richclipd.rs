@@ -111,17 +111,24 @@ async fn main() -> anyhow::Result<()> {
     // ── 6. Spawn capture task (best-effort; skip if no compositor) ────────────
     {
         let state_cap = state.clone();
+        let started_tx = cap_tx.clone();
         let item_tx = cap_tx.clone();
         let skipped_tx = cap_tx.clone();
 
         // Spawn the Wayland capture loop in a blocking thread.
         tokio::spawn(async move {
-            let sink = CaptureSink::new(move |item: CapturedItem| {
-                let _ = item_tx.send(CaptureMessage::Item(item));
-            })
-            .with_selection_skipped_handler(move || {
-                let _ = skipped_tx.send(CaptureMessage::SelectionSkipped);
-            });
+            let sink = CaptureSink::new_ordered(
+                move |selection_id| {
+                    let _ = started_tx.send(CaptureMessage::SelectionStarted { selection_id });
+                },
+                move |selection_id, item: CapturedItem| {
+                    let _ = item_tx.send(CaptureMessage::OrderedItem { selection_id, item });
+                },
+                move |selection_id| {
+                    let _ =
+                        skipped_tx.send(CaptureMessage::OrderedSelectionSkipped { selection_id });
+                },
+            );
             match WlrDataControlBackend::new() {
                 Ok(mut backend) => {
                     use richclip::backend::ClipboardBackend;
@@ -139,9 +146,15 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             while let Some(message) = cap_rx.recv().await {
                 message.apply_suppression_updates(&state_cap.suppression);
-                let item = match message {
-                    CaptureMessage::Item(item) => item,
-                    CaptureMessage::SelectionSkipped | CaptureMessage::Restore(_) => continue,
+                let (selection_id, item) = match message {
+                    CaptureMessage::OrderedItem { selection_id, item } => {
+                        (Some(selection_id), item)
+                    }
+                    CaptureMessage::Item(item) => (None, item),
+                    CaptureMessage::SelectionStarted { .. }
+                    | CaptureMessage::OrderedSelectionSkipped { .. }
+                    | CaptureMessage::SelectionSkipped
+                    | CaptureMessage::Restore(_) => continue,
                 };
                 let formats: Vec<(String, Vec<u8>)> = item
                     .formats
@@ -154,7 +167,13 @@ async fn main() -> anyhow::Result<()> {
                 // share one ordered channel, so the consumer applies each
                 // suppression change at its place in selection history.
                 let captured_fp = richclip_wayland::daemon::restore_capture_fingerprint(&formats);
-                if state_cap.suppression.observe_capture(&captured_fp) {
+                let is_restore_echo = match selection_id {
+                    Some(selection_id) => state_cap
+                        .suppression
+                        .observe_capture_for(selection_id, &captured_fp),
+                    None => state_cap.suppression.observe_capture(&captured_fp),
+                };
+                if is_restore_echo {
                     tracing::debug!("ignoring self-restore echo");
                     continue;
                 }

@@ -145,13 +145,18 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
             }
 
             zwlr_data_control_device_v1::Event::Selection { id } => {
+                // Publish the selection's position before any MIME filtering
+                // or blocking format drain. The item callback may run much
+                // later, but its ID still reflects when this event began.
+                let selection_id = state.sink.selection_started();
+
                 // `id` is `Option<ZwlrDataControlOfferV1>`; `None` means the
                 // selection was cleared (clipboard is empty).
                 let offer = match id {
                     Some(o) => o,
                     None => {
                         // Clipboard cleared; nothing to capture.
-                        state.sink.selection_skipped();
+                        state.sink.selection_skipped_for(selection_id);
                         return;
                     }
                 };
@@ -167,7 +172,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                             "Selection event for unknown offer {:?}; skipping",
                             offer.id()
                         );
-                        state.sink.selection_skipped();
+                        state.sink.selection_skipped_for(selection_id);
                         return;
                     }
                 };
@@ -180,7 +185,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                     );
                     // Clean up.
                     state.offers.remove(&offer.id());
-                    state.sink.selection_skipped();
+                    state.sink.selection_skipped_for(selection_id);
                     return;
                 }
 
@@ -189,7 +194,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 if accepted.is_empty() {
                     tracing::debug!("No accepted MIMEs in offer {:?}; skipping", offer.id());
                     state.offers.remove(&offer.id());
-                    state.sink.selection_skipped();
+                    state.sink.selection_skipped_for(selection_id);
                     return;
                 }
 
@@ -221,7 +226,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                             };
                             if !retain_format(&mut formats, format) {
                                 state.offers.remove(&offer.id());
-                                state.sink.selection_skipped();
+                                state.sink.selection_skipped_for(selection_id);
                                 return;
                             }
                             total_bytes =
@@ -251,11 +256,13 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
 
                 if formats.is_empty() {
                     tracing::debug!("No formats captured after drain; discarding item");
-                    state.sink.selection_skipped();
+                    state.sink.selection_skipped_for(selection_id);
                     return;
                 }
 
-                state.sink.push(CapturedItem { formats });
+                state
+                    .sink
+                    .push_for_selection(selection_id, CapturedItem { formats });
             }
 
             zwlr_data_control_device_v1::Event::PrimarySelection { .. } => {

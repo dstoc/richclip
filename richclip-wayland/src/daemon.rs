@@ -33,21 +33,40 @@ use richclip::{AddItemResult, Store};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
-pub struct RestoreSuppression(Arc<std::sync::Mutex<VecDeque<RestoreMarker>>>);
+pub struct RestoreSuppression(Arc<std::sync::Mutex<SuppressionState>>);
+
+#[derive(Default)]
+struct SuppressionState {
+    markers: VecDeque<RestoreMarker>,
+    latest_selection_id: u64,
+}
 
 struct RestoreMarker {
     token: Uuid,
     fingerprint: HashSet<(String, String)>,
     active: bool,
+    after_selection_id: u64,
 }
 
 /// Ordered messages shared by the capture backend and restore threads.
 ///
 /// Keeping restore lifecycle updates in this queue makes their order relative
-/// to captured and skipped selections visible to the delayed consumer.
+/// to captured and skipped selections visible to the delayed consumer. The
+/// capture start message also lets it distinguish a delayed drain from a
+/// selection that began after a restore was armed.
 pub enum CaptureMessage {
+    SelectionStarted {
+        selection_id: u64,
+    },
     Item(CapturedItem),
     SelectionSkipped,
+    OrderedItem {
+        selection_id: u64,
+        item: CapturedItem,
+    },
+    OrderedSelectionSkipped {
+        selection_id: u64,
+    },
     Restore(RestoreSuppressionEvent),
 }
 
@@ -70,28 +89,43 @@ impl CaptureMessage {
     pub fn apply_suppression_updates(&self, suppression: &RestoreSuppression) {
         match self {
             Self::Restore(event) => suppression.apply_event(event),
+            Self::SelectionStarted { selection_id } => suppression.selection_started(*selection_id),
+            Self::OrderedSelectionSkipped { selection_id } => {
+                suppression.observe_skipped_selection_for(*selection_id)
+            }
             Self::SelectionSkipped => suppression.observe_skipped_selection(),
-            Self::Item(_) => {}
+            Self::Item(_) | Self::OrderedItem { .. } => {}
         }
     }
 }
 
 impl RestoreSuppression {
     fn arm(&self, token: Uuid, fingerprint: HashSet<(String, String)>) {
-        if let Ok(mut markers) = self.0.lock() {
-            markers.push_back(RestoreMarker {
+        if let Ok(mut state) = self.0.lock() {
+            let after_selection_id = state.latest_selection_id;
+            state.markers.push_back(RestoreMarker {
                 token,
                 fingerprint,
                 active: false,
+                after_selection_id,
             });
         }
     }
 
     fn activate(&self, token: Uuid) {
-        if let Ok(mut markers) = self.0.lock()
-            && let Some(marker) = markers.iter_mut().find(|marker| marker.token == token)
+        if let Ok(mut state) = self.0.lock()
+            && let Some(marker) = state
+                .markers
+                .iter_mut()
+                .find(|marker| marker.token == token)
         {
             marker.active = true;
+        }
+    }
+
+    fn selection_started(&self, selection_id: u64) {
+        if let Ok(mut state) = self.0.lock() {
+            state.latest_selection_id = state.latest_selection_id.max(selection_id);
         }
     }
 
@@ -107,20 +141,29 @@ impl RestoreSuppression {
 
     /// Consume one matching restore echo. Keep separate markers for repeated
     /// restores because their captures may already be queued when the consumer
-    /// reaches them. A different capture clears older active markers so a later
-    /// genuine copy of the restored content reaches Store.
-    pub fn observe_capture(&self, fingerprint: &HashSet<(String, String)>) -> bool {
-        let Ok(mut markers) = self.0.lock() else {
+    /// reaches them. A different capture clears markers armed before that
+    /// selection started so a later genuine copy reaches Store.
+    pub fn observe_capture_for(
+        &self,
+        selection_id: u64,
+        fingerprint: &HashSet<(String, String)>,
+    ) -> bool {
+        let Ok(mut state) = self.0.lock() else {
             return false;
         };
 
-        let matching_token = markers
+        let matching_token = state
+            .markers
             .iter()
+            .filter(|marker| selection_id > marker.after_selection_id)
             .find(|marker| &marker.fingerprint == fingerprint)
             .map(|marker| marker.token);
         if let Some(matching_token) = matching_token {
             let mut passed_match = false;
-            markers.retain(|marker| {
+            state.markers.retain(|marker| {
+                if selection_id <= marker.after_selection_id {
+                    return true;
+                }
                 if marker.token == matching_token {
                     passed_match = true;
                     false
@@ -130,31 +173,56 @@ impl RestoreSuppression {
             });
             true
         } else {
-            // The queue establishes that every marker currently present
-            // precedes this selection, including markers whose activation
-            // update may still be queued behind it.
-            markers.clear();
+            // A selection that started before a restore must not cancel its
+            // marker, even if its blocking drain completes afterward.
+            state
+                .markers
+                .retain(|marker| selection_id <= marker.after_selection_id);
             false
         }
     }
 
+    /// Observe a capture that does not carry a selection-start ID.
+    ///
+    /// This preserves the original public API for non-Wayland callers. Such a
+    /// capture is treated as newer than every selection start already seen.
+    pub fn observe_capture(&self, fingerprint: &HashSet<(String, String)>) -> bool {
+        let selection_id = self.next_unstarted_selection_id();
+        self.observe_capture_for(selection_id, fingerprint)
+    }
+
     fn clear(&self, token: Uuid) {
-        if let Ok(mut markers) = self.0.lock() {
+        if let Ok(mut state) = self.0.lock() {
             // A restore that never activated cannot have produced an echo and
             // should not leave state behind after a failed setup. An activated
             // marker remains until its echo or a subsequent different capture
             // is observed; the echo may already be queued when its source is
             // cancelled by a newer selection.
-            markers.retain(|marker| marker.token != token || marker.active);
+            state
+                .markers
+                .retain(|marker| marker.token != token || marker.active);
         }
     }
 
-    /// Retire active markers when the capture backend reports a clipboard
-    /// selection that cannot be delivered as an item.
+    /// Retire markers for selections that began before this skipped selection.
     pub fn observe_skipped_selection(&self) {
-        if let Ok(mut markers) = self.0.lock() {
-            markers.clear();
+        let selection_id = self.next_unstarted_selection_id();
+        self.observe_skipped_selection_for(selection_id);
+    }
+
+    fn observe_skipped_selection_for(&self, selection_id: u64) {
+        if let Ok(mut state) = self.0.lock() {
+            state
+                .markers
+                .retain(|marker| selection_id <= marker.after_selection_id);
         }
+    }
+
+    fn next_unstarted_selection_id(&self) -> u64 {
+        self.0
+            .lock()
+            .map(|state| state.latest_selection_id.saturating_add(1))
+            .unwrap_or(0)
     }
 }
 
@@ -590,6 +658,15 @@ mod tests {
         HashSet::from([(mime.to_string(), richclip::blob_hash(bytes))])
     }
 
+    fn observe_selection(
+        suppression: &RestoreSuppression,
+        selection_id: u64,
+        fingerprint: &HashSet<(String, String)>,
+    ) -> bool {
+        suppression.selection_started(selection_id);
+        suppression.observe_capture_for(selection_id, fingerprint)
+    }
+
     #[test]
     fn restore_fingerprint_uses_capture_mime_normalization() {
         let actual = restore_capture_fingerprint(&[
@@ -607,8 +684,8 @@ mod tests {
         suppression.arm(token, restored.clone());
         suppression.activate(token);
 
-        assert!(suppression.observe_capture(&restored));
-        assert!(!suppression.observe_capture(&restored));
+        assert!(observe_selection(&suppression, 1, &restored));
+        assert!(!observe_selection(&suppression, 2, &restored));
     }
 
     #[test]
@@ -625,9 +702,9 @@ mod tests {
         suppression.clear(first_token); // first source is superseded
 
         // The capture consumer can be behind both completed captures.
-        assert!(suppression.observe_capture(&restored));
-        assert!(suppression.observe_capture(&restored));
-        assert!(!suppression.observe_capture(&restored));
+        assert!(observe_selection(&suppression, 1, &restored));
+        assert!(observe_selection(&suppression, 2, &restored));
+        assert!(!observe_selection(&suppression, 3, &restored));
     }
 
     #[test]
@@ -639,8 +716,8 @@ mod tests {
         suppression.arm(token, restored.clone());
         suppression.activate(token);
 
-        assert!(!suppression.observe_capture(&other));
-        assert!(!suppression.observe_capture(&restored));
+        assert!(!observe_selection(&suppression, 1, &other));
+        assert!(!observe_selection(&suppression, 2, &restored));
     }
 
     #[test]
@@ -652,14 +729,14 @@ mod tests {
         let failed_token = Uuid::now_v7();
         suppression.arm(failed_token, restored.clone());
         suppression.clear(failed_token); // failed before selection was activated
-        assert!(!suppression.observe_capture(&restored));
+        assert!(!observe_selection(&suppression, 1, &restored));
 
         let cancelled_token = Uuid::now_v7();
         suppression.arm(cancelled_token, restored.clone());
         suppression.activate(cancelled_token);
         suppression.clear(cancelled_token); // its queued echo may still arrive
-        assert!(!suppression.observe_capture(&other)); // a new selection retires it
-        assert!(!suppression.observe_capture(&restored)); // genuine later copy
+        assert!(!observe_selection(&suppression, 2, &other)); // a new selection retires it
+        assert!(!observe_selection(&suppression, 3, &restored)); // genuine later copy
     }
 
     #[test]
@@ -671,17 +748,25 @@ mod tests {
         suppression.activate(token);
         suppression.clear(token);
 
-        suppression.observe_skipped_selection(); // e.g. clipboard cleared/unsupported
-        assert!(!suppression.observe_capture(&restored));
+        suppression.selection_started(1);
+        suppression.observe_skipped_selection_for(1); // e.g. clipboard cleared/unsupported
+        assert!(!observe_selection(&suppression, 2, &restored));
     }
 
-    fn captured_item(mime: &str, bytes: &[u8]) -> CaptureMessage {
-        CaptureMessage::Item(CapturedItem {
-            formats: vec![richclip::backend::CapturedFormat {
-                mime: mime.into(),
-                bytes: bytes.to_vec(),
-            }],
-        })
+    fn selection_started(selection_id: u64) -> CaptureMessage {
+        CaptureMessage::SelectionStarted { selection_id }
+    }
+
+    fn captured_item(selection_id: u64, mime: &str, bytes: &[u8]) -> CaptureMessage {
+        CaptureMessage::OrderedItem {
+            selection_id,
+            item: CapturedItem {
+                formats: vec![richclip::backend::CapturedFormat {
+                    mime: mime.into(),
+                    bytes: bytes.to_vec(),
+                }],
+            },
+        }
     }
 
     fn apply_queued_message(
@@ -690,6 +775,15 @@ mod tests {
     ) -> Option<bool> {
         message.apply_suppression_updates(suppression);
         match message {
+            CaptureMessage::OrderedItem { selection_id, item } => {
+                let formats: Vec<(String, Vec<u8>)> = item
+                    .formats
+                    .into_iter()
+                    .map(|format| (format.mime, format.bytes))
+                    .collect();
+                let fingerprint = restore_capture_fingerprint(&formats);
+                Some(suppression.observe_capture_for(selection_id, &fingerprint))
+            }
             CaptureMessage::Item(item) => {
                 let formats: Vec<(String, Vec<u8>)> = item
                     .formats
@@ -699,7 +793,10 @@ mod tests {
                 let fingerprint = restore_capture_fingerprint(&formats);
                 Some(suppression.observe_capture(&fingerprint))
             }
-            CaptureMessage::SelectionSkipped | CaptureMessage::Restore(_) => None,
+            CaptureMessage::SelectionStarted { .. }
+            | CaptureMessage::OrderedSelectionSkipped { .. }
+            | CaptureMessage::SelectionSkipped
+            | CaptureMessage::Restore(_) => None,
         }
     }
 
@@ -719,7 +816,8 @@ mod tests {
             token: first,
         }))
         .unwrap();
-        tx.send(captured_item("text/plain", b"A")).unwrap();
+        tx.send(selection_started(1)).unwrap();
+        tx.send(captured_item(1, "text/plain", b"A")).unwrap();
         tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
             token: first,
         }))
@@ -727,10 +825,12 @@ mod tests {
 
         // Queue a different copy or a skipped selection after the first
         // restore, then queue a second restore before the consumer catches up.
+        tx.send(selection_started(2)).unwrap();
         if intervening_capture {
-            tx.send(captured_item("text/plain", b"B")).unwrap();
+            tx.send(captured_item(2, "text/plain", b"B")).unwrap();
         } else {
-            tx.send(CaptureMessage::SelectionSkipped).unwrap();
+            tx.send(CaptureMessage::OrderedSelectionSkipped { selection_id: 2 })
+                .unwrap();
         }
         tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
             token: second,
@@ -741,9 +841,11 @@ mod tests {
             token: second,
         }))
         .unwrap();
-        tx.send(captured_item("text/plain", b"A")).unwrap();
+        tx.send(selection_started(3)).unwrap();
+        tx.send(captured_item(3, "text/plain", b"A")).unwrap();
         // A later genuine copy must still be accepted.
-        tx.send(captured_item("text/plain", b"A")).unwrap();
+        tx.send(selection_started(4)).unwrap();
+        tx.send(captured_item(4, "text/plain", b"A")).unwrap();
 
         let suppression = RestoreSuppression::default();
         let outcomes: Vec<_> = std::iter::from_fn(|| {
@@ -757,7 +859,9 @@ mod tests {
             vec![
                 None,
                 None,
+                None,
                 Some(true),
+                None,
                 None,
                 if intervening_capture {
                     Some(false)
@@ -766,7 +870,9 @@ mod tests {
                 },
                 None,
                 None,
+                None,
                 Some(true),
+                None,
                 Some(false),
             ],
             "an older queued selection must not retire a later restore echo marker"
@@ -796,12 +902,14 @@ mod tests {
             fingerprint: restored,
         }))
         .unwrap();
-        tx.send(captured_item("text/plain", b"B")).unwrap();
+        tx.send(selection_started(1)).unwrap();
+        tx.send(captured_item(1, "text/plain", b"B")).unwrap();
         tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
             token,
         }))
         .unwrap();
-        tx.send(captured_item("text/plain", b"A")).unwrap();
+        tx.send(selection_started(2)).unwrap();
+        tx.send(captured_item(2, "text/plain", b"A")).unwrap();
 
         assert_eq!(
             apply_queued_message(&suppression, rx.try_recv().unwrap()),
@@ -809,7 +917,15 @@ mod tests {
         );
         assert_eq!(
             apply_queued_message(&suppression, rx.try_recv().unwrap()),
+            None
+        );
+        assert_eq!(
+            apply_queued_message(&suppression, rx.try_recv().unwrap()),
             Some(false)
+        );
+        assert_eq!(
+            apply_queued_message(&suppression, rx.try_recv().unwrap()),
+            None
         );
         assert_eq!(
             apply_queued_message(&suppression, rx.try_recv().unwrap()),
