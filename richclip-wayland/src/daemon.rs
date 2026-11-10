@@ -109,6 +109,19 @@ impl CaptureOrdering {
             Ok(())
         }
     }
+
+    /// Run the blocking capture barrier off the caller's thread, then pass its
+    /// result to `after` on that worker. Restore callbacks use this to keep
+    /// their Wayland event loop dispatching data requests while capture drains.
+    pub fn synchronize_in_background(
+        &self,
+        after: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let ordering = self.clone();
+        std::thread::Builder::new()
+            .name("richclip-capture-barrier".into())
+            .spawn(move || after(ordering.synchronize()))
+    }
 }
 
 #[derive(Default)]
@@ -122,6 +135,13 @@ struct RestoreMarker {
     fingerprint: HashSet<(String, String)>,
     active: bool,
     after_selection_id: u64,
+}
+
+#[derive(Default)]
+struct RestoreActivationState {
+    barrier_started: bool,
+    barrier_complete: bool,
+    finished: bool,
 }
 
 /// Ordered messages shared by the capture backend and restore threads.
@@ -272,14 +292,7 @@ impl RestoreSuppression {
 
     fn clear(&self, token: Uuid) {
         if let Ok(mut state) = self.0.lock() {
-            // A restore that never activated cannot have produced an echo and
-            // should not leave state behind after a failed setup. An activated
-            // marker remains until its echo or a subsequent different capture
-            // is observed; the echo may already be queued when its source is
-            // cancelled by a newer selection.
-            state
-                .markers
-                .retain(|marker| marker.token != token || marker.active);
+            state.markers.retain(|marker| marker.token != token);
         }
     }
 
@@ -323,8 +336,8 @@ pub struct DaemonState {
     /// selection order. It consumes one matching echo per restore. Markers
     /// remain inactive through the compositor's set_selection roundtrip and
     /// capture barrier, so selections in that setup window cannot retire them.
-    /// Active markers remain pending after a source is cancelled because its
-    /// echo may already be queued.
+    /// For an established source, cleanup is queued after the capture barrier,
+    /// so any echo observed by capture is ahead of that cleanup message.
     pub suppression: RestoreSuppression,
 
     /// Capture-connection barriers order restore markers before and after the
@@ -623,6 +636,8 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
     let arm_tx = capture_tx.clone();
     let activate_tx = capture_tx.clone();
     let activation_ordering = capture_ordering.clone();
+    let activation_state = Arc::new(StdMutex::new(RestoreActivationState::default()));
+    let activation_state_for_thread = activation_state.clone();
     std::thread::spawn(move || {
         let mut selection_permit = Some(selection_permit);
         let result = crate::restore::run_restore_with_callbacks(
@@ -639,24 +654,60 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
                 }
             },
             move || {
-                match activation_ordering.synchronize() {
-                    Ok(()) => {
-                        let _ = activate_tx.send(CaptureMessage::Restore(
-                            RestoreSuppressionEvent::Activate { token },
-                        ));
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "could not order restore activation with capture events: {error}"
-                        );
-                    }
+                activation_state_for_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .barrier_started = true;
+
+                let worker_state = activation_state_for_thread.clone();
+                let permit = selection_permit.take();
+                let fallback_tx = activate_tx.clone();
+                let activation_waiter = activation_ordering.synchronize_in_background(
+                    move |barrier_result| {
+                        let mut activation = worker_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        activation.barrier_complete = true;
+                        let event = match (barrier_result, activation.finished) {
+                            (Ok(()), false) => RestoreSuppressionEvent::Activate { token },
+                            (Err(error), _) => {
+                                tracing::warn!(
+                                    "could not order restore activation with capture events: {error}"
+                                );
+                                RestoreSuppressionEvent::Clear { token }
+                            }
+                            (Ok(()), true) => RestoreSuppressionEvent::Clear { token },
+                        };
+                        let _ = activate_tx.send(CaptureMessage::Restore(event));
+                        drop(activation);
+                        drop(permit);
+                    },
+                );
+                if let Err(error) = activation_waiter {
+                    tracing::warn!("could not start restore activation barrier: {error}");
+                    activation_state_for_thread
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .barrier_complete = true;
+                    let _ =
+                        fallback_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
+                            token,
+                        }));
                 }
-                drop(selection_permit.take());
             },
         );
-        let _ = capture_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
-            token,
-        }));
+        let cleanup_now = {
+            let mut activation = activation_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            activation.finished = true;
+            !activation.barrier_started || activation.barrier_complete
+        };
+        if cleanup_now {
+            let _ = capture_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
+                token,
+            }));
+        }
         if let Err(e) = result {
             tracing::warn!("restore thread exited with error: {e}");
         }
@@ -811,10 +862,8 @@ mod tests {
         suppression.activate(first_token);
         suppression.arm(second_token, restored.clone());
         suppression.activate(second_token);
-        suppression.clear(first_token); // first source is superseded
-
-        // The capture consumer can be behind both completed captures.
         assert!(observe_selection(&suppression, 1, &restored));
+        suppression.clear(first_token); // cleanup follows the queued first echo
         assert!(observe_selection(&suppression, 2, &restored));
         assert!(!observe_selection(&suppression, 3, &restored));
     }
@@ -846,8 +895,8 @@ mod tests {
         let cancelled_token = Uuid::now_v7();
         suppression.arm(cancelled_token, restored.clone());
         suppression.activate(cancelled_token);
-        suppression.clear(cancelled_token); // its queued echo may still arrive
-        assert!(!observe_selection(&suppression, 2, &other)); // a new selection retires it
+        suppression.clear(cancelled_token); // cleanup follows the capture barrier
+        assert!(!observe_selection(&suppression, 2, &other));
         assert!(!observe_selection(&suppression, 3, &restored)); // genuine later copy
     }
 
@@ -858,7 +907,6 @@ mod tests {
         let token = Uuid::now_v7();
         suppression.arm(token, restored.clone());
         suppression.activate(token);
-        suppression.clear(token);
 
         suppression.selection_started(1);
         suppression.observe_skipped_selection_for(1); // e.g. clipboard cleared/unsupported
@@ -1000,6 +1048,45 @@ mod tests {
     #[test]
     fn review_queued_clear_between_restores_preserves_new_echo() {
         check_delayed_consumer(false);
+    }
+
+    #[test]
+    fn cancelled_restore_cleanup_does_not_suppress_a_later_matching_copy() {
+        let suppression = RestoreSuppression::default();
+        let restored = fingerprint("text/plain", b"A");
+        let token = Uuid::now_v7();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // The restore source is superseded before capture has completed its
+        // post-selection barrier, so B is observed before activation.
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
+            token,
+            fingerprint: restored.clone(),
+        }))
+        .unwrap();
+        tx.send(selection_started(1)).unwrap();
+        tx.send(captured_item(1, "text/plain", b"B")).unwrap();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
+            token,
+        }))
+        .unwrap();
+        tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {
+            token,
+        }))
+        .unwrap();
+        tx.send(selection_started(2)).unwrap();
+        tx.send(captured_item(2, "text/plain", b"A")).unwrap();
+
+        let outcomes: Vec<_> = std::iter::from_fn(|| {
+            rx.try_recv()
+                .ok()
+                .map(|message| apply_queued_message(&suppression, message))
+        })
+        .collect();
+        assert_eq!(
+            outcomes,
+            vec![None, None, Some(false), None, None, None, Some(false)]
+        );
     }
 
     #[test]
