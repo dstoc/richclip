@@ -13,7 +13,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
 use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,7 +22,7 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use crate::filter::{CaptureConfig, accepted_mimes};
-use richclip::backend::CapturedItem;
+use richclip::backend::{CaptureOrderingBarrier, CapturedItem};
 use richclip::ipc::{
     AddItemParams, Request, Response, UpdateItemParams, WatchEvent, WatchEventsParams,
 };
@@ -34,6 +34,82 @@ use richclip::{AddItemResult, Store};
 
 #[derive(Clone, Default)]
 pub struct RestoreSuppression(Arc<std::sync::Mutex<SuppressionState>>);
+
+/// Coordinates restore setup with the capture connection's pending event
+/// queue. A restore marker is armed only after this barrier has dispatched
+/// selection notifications that were already pending before the restore.
+#[derive(Clone)]
+pub struct CaptureOrdering(Arc<(StdMutex<CaptureOrderingState>, Condvar)>);
+
+enum CaptureOrderingState {
+    Starting,
+    Ready(CaptureOrderingBarrier),
+    Unavailable,
+}
+
+impl Default for CaptureOrdering {
+    fn default() -> Self {
+        Self(Arc::new((
+            StdMutex::new(CaptureOrderingState::Unavailable),
+            Condvar::new(),
+        )))
+    }
+}
+
+impl CaptureOrdering {
+    fn starting() -> Self {
+        Self(Arc::new((
+            StdMutex::new(CaptureOrderingState::Starting),
+            Condvar::new(),
+        )))
+    }
+
+    /// Install the barrier provided by the initialized capture backend.
+    pub fn install(&self, barrier: CaptureOrderingBarrier) {
+        let (state, ready) = &*self.0;
+        if let Ok(mut state) = state.lock() {
+            *state = CaptureOrderingState::Ready(barrier);
+            ready.notify_all();
+        }
+    }
+
+    /// Mark capture unavailable so restore setup does not wait forever when
+    /// the compositor or capture protocol is unavailable.
+    pub fn mark_unavailable(&self) {
+        let (state, ready) = &*self.0;
+        if let Ok(mut state) = state.lock() {
+            *state = CaptureOrderingState::Unavailable;
+            ready.notify_all();
+        }
+    }
+
+    /// Wait until capture setup is resolved, then dispatch the pending-event
+    /// barrier if the capture backend is running.
+    pub fn synchronize(&self) -> Result<(), String> {
+        let barrier = {
+            let (state, ready) = &*self.0;
+            let mut state = state
+                .lock()
+                .map_err(|_| "capture ordering state was poisoned".to_string())?;
+            while matches!(*state, CaptureOrderingState::Starting) {
+                state = ready
+                    .wait(state)
+                    .map_err(|_| "capture ordering state was poisoned".to_string())?;
+            }
+            match &*state {
+                CaptureOrderingState::Ready(barrier) => Some(barrier.clone()),
+                CaptureOrderingState::Unavailable => None,
+                CaptureOrderingState::Starting => unreachable!(),
+            }
+        };
+
+        if let Some(barrier) = barrier {
+            barrier()
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Default)]
 struct SuppressionState {
@@ -247,6 +323,13 @@ pub struct DaemonState {
     /// already be queued.
     pub suppression: RestoreSuppression,
 
+    /// Capture-connection barrier used to order restore markers after pending
+    /// selection notifications.
+    pub capture_ordering: CaptureOrdering,
+
+    /// Serializes the short restore setup window through selection activation.
+    restore_selection_gate: Arc<tokio::sync::Semaphore>,
+
     /// Ordered channel shared by capture observations and restore lifecycle
     /// updates. The daemon wires its consumer before accepting IPC requests.
     capture_tx: Option<tokio::sync::mpsc::UnboundedSender<CaptureMessage>>,
@@ -260,6 +343,8 @@ impl DaemonState {
             watch_tx,
             cache_dir,
             suppression: RestoreSuppression::default(),
+            capture_ordering: CaptureOrdering::default(),
+            restore_selection_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             capture_tx: None,
         }
     }
@@ -270,6 +355,7 @@ impl DaemonState {
         capture_tx: tokio::sync::mpsc::UnboundedSender<CaptureMessage>,
     ) -> Self {
         self.capture_tx = Some(capture_tx);
+        self.capture_ordering = CaptureOrdering::starting();
         self
     }
 }
@@ -515,8 +601,14 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
         return Response::err("restore capture event queue is not configured", "error");
     };
 
+    let selection_permit = match state.restore_selection_gate.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return Response::err("restore selection gate is closed", "error"),
+    };
+
     // ── 3. Build suppression fingerprint ─────────────────────────────────────
     let fingerprint = restore_capture_fingerprint(&formats);
+    let capture_ordering = state.capture_ordering.clone();
 
     // ── 4. Spawn restore thread ───────────────────────────────────────────────
     // The restore runs in a dedicated thread so it doesn't block the async
@@ -527,19 +619,26 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
     let arm_tx = capture_tx.clone();
     let activate_tx = capture_tx.clone();
     std::thread::spawn(move || {
+        let mut selection_permit = Some(selection_permit);
         let result = crate::restore::run_restore_with_callbacks(
             formats,
-            move || {
-                let _ = arm_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
-                    token,
-                    fingerprint,
-                }));
+            move || match capture_ordering.synchronize() {
+                Ok(()) => {
+                    let _ = arm_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Arm {
+                        token,
+                        fingerprint,
+                    }));
+                }
+                Err(error) => {
+                    tracing::warn!("could not order restore marker with capture events: {error}");
+                }
             },
             move || {
                 let _ =
                     activate_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
                         token,
                     }));
+                drop(selection_permit.take());
             },
         );
         let _ = capture_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Clear {

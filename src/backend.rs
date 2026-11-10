@@ -8,6 +8,11 @@
 
 use crate::model::ItemWithFormats;
 
+/// A synchronous barrier that waits until the backend has dispatched all
+/// selection events already pending on its capture connection.
+pub type CaptureOrderingBarrier =
+    std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync + 'static>;
+
 /// One captured MIME representation of a clipboard item.
 pub struct CapturedFormat {
     pub mime: String,
@@ -30,6 +35,7 @@ pub struct CaptureSink {
     selection_started_handler: Option<Box<dyn FnMut(u64) + Send>>,
     ordered_handler: Option<Box<dyn FnMut(u64, CapturedItem) + Send>>,
     ordered_selection_skipped_handler: Option<Box<dyn FnMut(u64) + Send>>,
+    ordering_barrier_handler: Option<Box<dyn FnOnce(CaptureOrderingBarrier) + Send>>,
     next_selection_id: u64,
 }
 
@@ -43,6 +49,7 @@ impl CaptureSink {
             selection_started_handler: None,
             ordered_handler: None,
             ordered_selection_skipped_handler: None,
+            ordering_barrier_handler: None,
             next_selection_id: 0,
         }
     }
@@ -63,7 +70,30 @@ impl CaptureSink {
             selection_started_handler: Some(Box::new(started_handler)),
             ordered_handler: Some(Box::new(item_handler)),
             ordered_selection_skipped_handler: Some(Box::new(selection_skipped_handler)),
+            ordering_barrier_handler: None,
             next_selection_id: 0,
+        }
+    }
+
+    /// Arrange to receive an ordering barrier after the backend has connected
+    /// and before it begins dispatching selection events.
+    ///
+    /// A caller can use the barrier to order external lifecycle events, such
+    /// as restore markers, after selection notifications already pending in
+    /// the backend's event queue.
+    pub fn with_ordering_barrier_handler(
+        mut self,
+        handler: impl FnOnce(CaptureOrderingBarrier) + Send + 'static,
+    ) -> Self {
+        self.ordering_barrier_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Notify the caller that the backend is ready and provide its ordering
+    /// barrier, if one was requested.
+    pub fn capture_initialized(&mut self, barrier: CaptureOrderingBarrier) {
+        if let Some(handler) = self.ordering_barrier_handler.take() {
+            handler(barrier);
         }
     }
 

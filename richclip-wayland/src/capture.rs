@@ -27,7 +27,7 @@ use std::os::unix::net::UnixStream;
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_registry, wl_seat::WlSeat},
+    protocol::{wl_callback, wl_registry, wl_seat::WlSeat},
 };
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
@@ -35,7 +35,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
 };
 
-use richclip::backend::{CaptureSink, CapturedFormat, CapturedItem};
+use richclip::backend::{CaptureOrderingBarrier, CaptureSink, CapturedFormat, CapturedItem};
 
 use crate::filter::{self, CaptureConfig};
 
@@ -55,6 +55,10 @@ struct State {
 
     /// The connection handle; stored so `Dispatch` impls can call `flush()`.
     conn: Connection,
+    /// Barrier callbacks are acknowledged after the current event batch has
+    /// been fully dispatched, so preceding selection callbacks have already
+    /// published their ordered messages.
+    barrier_completions: Vec<std::sync::mpsc::Sender<()>>,
     // TODO (P2-M4 restore milestone): When the daemon owns the current
     // selection (after a `restore_item` call), record the source object ID
     // here so that `Selection` events for that offer can be short-circuited
@@ -64,6 +68,14 @@ struct State {
     //
     // The check would look like:
     //   if Some(offer.id()) == state.owned_source_id { return; }
+}
+
+impl State {
+    fn complete_ordering_barriers(&mut self) {
+        for completion in self.barrier_completions.drain(..) {
+            let _ = completion.send(());
+        }
+    }
 }
 
 // ─── Dispatch<WlRegistry, GlobalListContents> ─────────────────────────────────
@@ -81,6 +93,24 @@ impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListConten
         // Dynamic global add/remove events after initial enumeration. We do
         // not handle hot-plug of the data-control manager or seats; restart
         // the daemon if the compositor's global list changes significantly.
+    }
+}
+
+// Restore threads send wl_display.sync on the capture connection and wait for
+// this callback. The acknowledgement is deferred until blocking_dispatch
+// returns, after every event in that read batch has run its handler.
+impl Dispatch<wl_callback::WlCallback, std::sync::mpsc::Sender<()>> for State {
+    fn event(
+        state: &mut Self,
+        _callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        completion: &std::sync::mpsc::Sender<()>,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.barrier_completions.push(completion.clone());
+        }
     }
 }
 
@@ -432,7 +462,18 @@ pub fn run_capture(config: CaptureConfig, sink: CaptureSink) -> anyhow::Result<(
         sink,
         offers: HashMap::new(),
         conn: conn.clone(),
+        barrier_completions: Vec::new(),
     };
+
+    let barrier_conn = conn.clone();
+    let barrier_qh = qh.clone();
+    let ordering_barrier: CaptureOrderingBarrier = std::sync::Arc::new(move || {
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let _callback = barrier_conn.display().sync(&barrier_qh, completion_tx);
+        barrier_conn.flush().map_err(|error| error.to_string())?;
+        completion_rx.recv().map_err(|error| error.to_string())
+    });
+    state.sink.capture_initialized(ordering_barrier);
 
     // Flush the requests above before entering the dispatch loop.
     event_queue.flush()?;
@@ -444,6 +485,7 @@ pub fn run_capture(config: CaptureConfig, sink: CaptureSink) -> anyhow::Result<(
     // the connection, which propagates up as our return value.
     loop {
         event_queue.blocking_dispatch(&mut state)?;
+        state.complete_ordering_barriers();
     }
 }
 

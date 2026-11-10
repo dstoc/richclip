@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         let started_tx = cap_tx.clone();
         let item_tx = cap_tx.clone();
         let skipped_tx = cap_tx.clone();
+        let capture_ordering = state_cap.capture_ordering.clone();
 
         // Spawn the Wayland capture loop in a blocking thread.
         tokio::spawn(async move {
@@ -128,7 +129,11 @@ async fn main() -> anyhow::Result<()> {
                     let _ =
                         skipped_tx.send(CaptureMessage::OrderedSelectionSkipped { selection_id });
                 },
-            );
+            )
+            .with_ordering_barrier_handler({
+                let capture_ordering = capture_ordering.clone();
+                move |barrier| capture_ordering.install(barrier)
+            });
             match WlrDataControlBackend::new() {
                 Ok(mut backend) => {
                     use richclip::backend::ClipboardBackend;
@@ -140,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                     warn!("failed to create capture backend: {e}");
                 }
             }
+            capture_ordering.mark_unavailable();
         });
 
         // Spawn consumer that converts CapturedItems into store writes + events.
