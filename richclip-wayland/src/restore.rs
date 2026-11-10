@@ -266,7 +266,7 @@ pub fn run_restore(formats: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
 }
 
 /// Restore formats and notify the caller immediately before selection is
-/// requested and after the request has been flushed. The daemon uses these
+/// requested and after the compositor has processed the flushed request. The daemon uses these
 /// hooks to scope its one-shot echo marker to this restore operation.
 pub fn run_restore_with_callbacks(
     formats: Vec<(String, Vec<u8>)>,
@@ -315,7 +315,6 @@ pub fn run_restore_with_callbacks(
 
     // Flush all queued requests to the compositor before entering the loop.
     event_queue.flush()?;
-    after_selection();
 
     // ── 6. Build initial state ────────────────────────────────────────────────
     let blobs: HashMap<String, Vec<u8>> = formats.into_iter().collect();
@@ -324,6 +323,13 @@ pub fn run_restore_with_callbacks(
         source,
         done: false,
     };
+
+    // Confirm that the compositor processed set_selection before the daemon
+    // places its activation event behind the corresponding capture-side event
+    // batch. This roundtrip also dispatches an immediate cancellation if a
+    // newer selection superseded the restore during setup.
+    event_queue.roundtrip(&mut state)?;
+    after_selection();
 
     // ── 7. Dispatch loop ──────────────────────────────────────────────────────
     // Block until events arrive, dispatch them, then check `done`.

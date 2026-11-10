@@ -36,8 +36,8 @@ use richclip::{AddItemResult, Store};
 pub struct RestoreSuppression(Arc<std::sync::Mutex<SuppressionState>>);
 
 /// Coordinates restore setup with the capture connection's pending event
-/// queue. A restore marker is armed only after this barrier has dispatched
-/// selection notifications that were already pending before the restore.
+/// queue. Barriers order selection notifications against both ends of the
+/// restore selection request.
 #[derive(Clone)]
 pub struct CaptureOrdering(Arc<(StdMutex<CaptureOrderingState>, Condvar)>);
 
@@ -217,8 +217,9 @@ impl RestoreSuppression {
 
     /// Consume one matching restore echo. Keep separate markers for repeated
     /// restores because their captures may already be queued when the consumer
-    /// reaches them. A different capture clears markers armed before that
-    /// selection started so a later genuine copy reaches Store.
+    /// reaches them. Inactive markers are retained across other selections:
+    /// they may have started after the pre-restore barrier but before the
+    /// actual selection request reached the compositor.
     pub fn observe_capture_for(
         &self,
         selection_id: u64,
@@ -250,10 +251,12 @@ impl RestoreSuppression {
             true
         } else {
             // A selection that started before a restore must not cancel its
-            // marker, even if its blocking drain completes afterward.
+            // marker, even if its blocking drain completes afterward. Until
+            // setup is activated, selections can also be queued in the gap
+            // between the capture barrier and the restore's set_selection.
             state
                 .markers
-                .retain(|marker| selection_id <= marker.after_selection_id);
+                .retain(|marker| selection_id <= marker.after_selection_id || !marker.active);
             false
         }
     }
@@ -290,7 +293,7 @@ impl RestoreSuppression {
         if let Ok(mut state) = self.0.lock() {
             state
                 .markers
-                .retain(|marker| selection_id <= marker.after_selection_id);
+                .retain(|marker| selection_id <= marker.after_selection_id || !marker.active);
         }
     }
 
@@ -317,14 +320,15 @@ pub struct DaemonState {
     /// Self-capture suppression marker.
     ///
     /// The capture consumer checks captures against restore fingerprints in
-    /// selection order. It consumes one matching echo per restore and clears
-    /// older markers on a different capture or skipped selection. Markers
-    /// remain pending after an active source is cancelled because its echo may
-    /// already be queued.
+    /// selection order. It consumes one matching echo per restore. Markers
+    /// remain inactive through the compositor's set_selection roundtrip and
+    /// capture barrier, so selections in that setup window cannot retire them.
+    /// Active markers remain pending after a source is cancelled because its
+    /// echo may already be queued.
     pub suppression: RestoreSuppression,
 
-    /// Capture-connection barrier used to order restore markers after pending
-    /// selection notifications.
+    /// Capture-connection barriers order restore markers before and after the
+    /// compositor processes a restore selection request.
     pub capture_ordering: CaptureOrdering,
 
     /// Serializes the short restore setup window through selection activation.
@@ -618,6 +622,7 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
     let token = Uuid::now_v7();
     let arm_tx = capture_tx.clone();
     let activate_tx = capture_tx.clone();
+    let activation_ordering = capture_ordering.clone();
     std::thread::spawn(move || {
         let mut selection_permit = Some(selection_permit);
         let result = crate::restore::run_restore_with_callbacks(
@@ -634,10 +639,18 @@ async fn handle_restore_item(id: Uuid, state: &DaemonState) -> Response {
                 }
             },
             move || {
-                let _ =
-                    activate_tx.send(CaptureMessage::Restore(RestoreSuppressionEvent::Activate {
-                        token,
-                    }));
+                match activation_ordering.synchronize() {
+                    Ok(()) => {
+                        let _ = activate_tx.send(CaptureMessage::Restore(
+                            RestoreSuppressionEvent::Activate { token },
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "could not order restore activation with capture events: {error}"
+                        );
+                    }
+                }
                 drop(selection_permit.take());
             },
         );
@@ -990,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn older_selection_cannot_revive_pending_restore_marker() {
+    fn selection_during_restore_setup_does_not_retire_pending_marker() {
         let suppression = RestoreSuppression::default();
         let token = Uuid::now_v7();
         let restored = fingerprint("text/plain", b"A");
@@ -1032,7 +1045,7 @@ mod tests {
         );
         assert_eq!(
             apply_queued_message(&suppression, rx.try_recv().unwrap()),
-            Some(false)
+            Some(true)
         );
     }
 
